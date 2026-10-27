@@ -59,7 +59,7 @@ jobs:
         run: |
           entry_points=(
             AlphaPose_to_OpenPose
-            # Blazepose_runsave # requires pip install mediapipe
+            # Mediapipe_to_pose_or_trc # requires pip install mediapipe
             bodykin_from_mot_osim
             c3d_to_trc
             calib_easymocap_to_toml
@@ -98,4 +98,4 @@ jobs:
           PYTHONUNBUFFERED: "1"
           KMP_DUPLICATE_LIB_OK: TRUE
         run: |
-          uv run pytest -v Pose2Sim/Utilities/tests.py --capture=sys
+          uv run pytest -v --log-cli-level=INFO --capture=tee-sys Pose2Sim/Utilities/tests.py

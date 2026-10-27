@@ -25,11 +25,19 @@ import os
 import numpy as np
 import json
 import re
-import matplotlib.pyplot as plt 
-from matplotlib.animation import FuncAnimation 
 import argparse
 from importlib.metadata import version
 from pathlib import Path
+import matplotlib as mpl
+try:
+    mpl.use('qtagg')
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.close(fig)
+except Exception as e:
+    print(f"GUI not available ({e}), falling back to 'Agg' backend.")
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
 
 
 ## AUTHORSHIP INFORMATION
@@ -162,6 +170,8 @@ def json_display_without_img_func(**args):
         CONF += [conffrm]
 
     # Scatterplot
+    from matplotlib.animation import FuncAnimation 
+
     def update(frame):
         if frame==len(json_fnames)-1:
             plt.close(fig)

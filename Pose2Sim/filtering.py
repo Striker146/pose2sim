@@ -26,12 +26,19 @@ import os
 import math
 import numpy as np
 np.set_printoptions(legacy='1.21') # otherwise prints np.float64(3.0) rather than 3.0
-import matplotlib as mpl
-import matplotlib.pyplot as plt
 import logging
-import platform
 from importlib.metadata import version
 from pathlib import Path
+import matplotlib as mpl
+try:
+    mpl.use('qtagg')
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.close(fig)
+except Exception as e:
+    logging.warning(f"GUI not available ({e}), falling back to 'Agg' backend.")
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
 
 from scipy import signal
 from scipy.interpolate import make_smoothing_spline
@@ -670,11 +677,7 @@ def display_figures_trc(Q_unfilt, Q_filt, time_col, keypoints_names, person_id=0
     - matplotlib window with tabbed figures for each keypoint
     '''
 
-    os_name = platform.system()
-    if os_name == 'Windows':
-        mpl.use('qtagg') # windows
     mpl.rc('figure', max_open_warning=0)
-
     pw = plotWindow()
     pw.MainWindow.setWindowTitle('Person '+ str(person_id) + ' coordinates')
     for id, keypoint in enumerate(keypoints_names):
@@ -726,11 +729,7 @@ def display_figures_mot(Q_unfilt, Q_filt, time_col, col_names, person_id=0, show
     - plotWindow with tabbed figures
     '''
 
-    os_name = platform.system()
-    if os_name == 'Windows':
-        mpl.use('qtagg')
     mpl.rc('figure', max_open_warning=0)
-
     pw = plotWindow()
     pw.MainWindow.setWindowTitle('Person ' + str(person_id) + ' mot data')
     
@@ -919,8 +918,10 @@ def filter_all(config_dict):
         if reject_outliers:
             Q_coords = Q_coords.apply(hampel_filter, axis=0)  # Hampel filter for outlier rejection
         
-        if do_filter:
+        if do_filter or filter_ik:
             Q_filt = Q_coords.apply(filter1d, axis=0, args = [config_dict, filter_type, frame_rate])
+        else:
+            Q_filt = Q_coords.copy()
 
         if not do_filter and not reject_outliers:
             logging.warning(f'Reject_outliers and filter have been set to false. No further processing done on {file_path_in}.\n')
@@ -938,6 +939,7 @@ def filter_all(config_dict):
                         title = pw.tabs.tabText(n)
                         plot_path = Path(plots_output_dir) / f'person{person_id:02d}_{title.replace(" ", "_").replace("/", "_")}.png'
                         f.savefig(plot_path, dpi=dpi, bbox_inches='tight')
+                pw.close()
 
             # Write output file
             if filter_ik:

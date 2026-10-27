@@ -42,19 +42,13 @@
 
 
 ## INIT
+import os
 from pathlib import Path
 import math
 import numpy as np
 np.set_printoptions(legacy='1.21')
 import pandas as pd
 import sys
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import platform
-os_name = platform.system()
-if os_name == 'Windows':
-    mpl.use('qtagg')
-mpl.rc('figure', max_open_warning=0)
 from scipy import signal
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
@@ -66,6 +60,16 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 from filterpy.kalman import KalmanFilter
 from filterpy.common import Q_discrete_white_noise
 import argparse
+import matplotlib as mpl
+try:
+    mpl.use('qtagg')
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.close(fig)
+except Exception as e:
+    print(f"GUI not available ({e}), falling back to 'Agg' backend.")
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
 
 
 ## AUTHORSHIP INFORMATION
@@ -779,6 +783,7 @@ def display_figures_trc(Q_unfilt, Q_filt, time_col, keypoints_names):
     - matplotlib window with tabbed figures for each keypoint
     '''
     
+    mpl.rc('figure', max_open_warning=0)
     pw = plotWindow()
     pw.MainWindow.setWindowTitle('TRC Filtering Results')
     for id, keypoint in enumerate(keypoints_names):
@@ -825,6 +830,7 @@ def display_figures_mot(Q_unfilt, Q_filt, time_col, col_names):
     - matplotlib window with tabbed figures
     '''
 
+    mpl.rc('figure', max_open_warning=0)
     pw = plotWindow()
     pw.MainWindow.setWindowTitle('MOT Filtering Results')
     
@@ -1015,11 +1021,11 @@ def trc_filter_func(**args):
     
     if is_mot:
         if output_path is None:
-            output_path = input_path.replace('.mot', f'_filt_{filter_type}.mot')
+            output_path = str(input_path).replace('.mot', f'_filt_{filter_type}.mot')
         write_mot(output_path, Q_filt, time_col, header)
     else:
         if output_path is None:
-            output_path = input_path.replace('.trc', f'_filt_{filter_type}.trc')
+            output_path = str(input_path).replace('.trc', f'_filt_{filter_type}.trc')
         with open(output_path, 'w') as trc_o:
             [trc_o.write(line) for line in header]
             Q_filt.insert(0, 'Frame#', frames_col)

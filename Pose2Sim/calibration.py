@@ -29,15 +29,26 @@ OUTPUTS:
 
 
 ## INIT
-from Pose2Sim.common import world_to_camera_persp, rotate_cam, quat2mat, euclidean_distance, natural_sort_key, zup2yup, set_always_on_top
+from Pose2Sim.common import world_to_camera_persp, rotate_cam, quat2mat, euclidean_distance, natural_sort_key, zup2yup, \
+                            set_always_on_top, show_qt_message_box, is_video_file, is_image_file
 
 import os
 import logging
 import pickle
 import numpy as np
-import pandas as pd
 np.set_printoptions(legacy='1.21') # otherwise prints np.float64(3.0) rather than 3.0
 os.environ["OPENCV_LOG_LEVEL"]="FATAL"
+import matplotlib as mpl
+try:
+    mpl.use('qtagg')
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.close(fig)
+except Exception as e:
+    logging.warning(f"GUI not available ({e}), falling back to 'Agg' backend.")
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
+import pandas as pd
 import cv2
 import rtoml
 import json
@@ -46,14 +57,10 @@ from lxml import etree
 from importlib.metadata import version
 from pathlib import Path
 import warnings
-import customtkinter as ctk
-from tkinter import messagebox
-import matplotlib.pyplot as plt
-from mpl_interactions import zoom_factory, panhandler
-from PIL import Image
 from contextlib import contextmanager,redirect_stderr,redirect_stdout
 from os import devnull
 
+outline_offsets = [(-2,-2),(-2,2),(2,-2),(2,2),(-2,0),(2,0),(0,-2),(0,2)]
 
 ## AUTHORSHIP INFORMATION
 __author__ = "David Pagnon"
@@ -131,7 +138,7 @@ def read_qca(qca_path, binning_factor):
     for i, tag in enumerate(root.findall('cameras/camera')):
         ret += [float(tag.attrib.get('avg-residual'))]
         C += [tag.attrib.get('serial')]
-        if any(model in tag.attrib.get('model', '').lower() for model in ["video", "none"]):
+        if any(model in tag.attrib.get('model', '').lower() for model in ["video", "hybrid", "none"]):
             vid_id += [i]
     
     # Image size
@@ -264,49 +271,57 @@ def read_vicon(vicon_path):
 
     root = etree.parse(vicon_path).getroot()
     ret, C, S, D, K, R, T = [], [], [], [], [], [], []
-    vid_id = []
+    vid_id, vid_ids = 0, []
+
+    video_path = Path(vicon_path).parents[1] / 'videos'
+    if not video_path.exists():
+        logging.error(f'No video folder found at {video_path}. Required for Vicon calibration.')
+        raise FileNotFoundError(f'No video folder found at {video_path}. Required for Vicon calibration.')
     
-    # Camera name and image size
-    for i, tag in enumerate(root.findall('Camera')):
-        C += [tag.attrib.get('DEVICEID')]
-        S += [[float(t) for t in tag.attrib.get('SENSOR_SIZE').split()]]
-        ret += [float(tag.findall('KeyFrames/KeyFrame')[0].attrib.get('WORLD_ERROR'))]
-        vid_id += [i]
-        
-    # Intrinsic parameters: distorsion and intrinsic matrix
     for cam_elem in root.findall('Camera'):
-        try:
-            dist = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('VICON_RADIAL2').split()[3:5]
-        except:
-            dist = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('VICON_RADIAL').split()
-        D += [[float(d) for d in dist] + [0.0, 0.0]]
+        if cam_elem.attrib.get('SYSTEM') == 'DV':
+            vid_ids += [vid_id]
+            vid_id += 1
 
-        fu = float(cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('FOCAL_LENGTH'))
-        fv = fu / float(cam_elem.attrib.get('PIXEL_ASPECT_RATIO'))
-        cam_center = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('PRINCIPAL_POINT').split()
-        cu, cv = [float(c) for c in cam_center]
-        K += [np.array([fu, 0., cu, 0., fv, cv, 0., 0., 1.]).reshape(3,3)]
+            # Camera name and errors
+            cam_name = cam_elem.attrib.get('DEVICEID')
+            C += [cam_name]
+            ret += [float(cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('WORLD_ERROR'))]
+            
+            # Image size and errors
+            cam_path = list(video_path.glob(f'*{cam_name}*'))[0]
+            cap = cv2.VideoCapture(cam_path)
+            img_res = [int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))]
+            S += [img_res]
 
-    # Extrinsic parameters: rotation matrix and translation vector
-    for cam_elem in root.findall('Camera'):
-        rot = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('ORIENTATION').split()
-        R_quat = [float(r) for r in rot]
-        R_mat = quat2mat(R_quat, scalar_idx=3)
-        R += [R_mat]
+            # Distorsion
+            try:
+                dist = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('VICON_RADIAL2').split()[3:5]
+            except:
+                dist = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('VICON_RADIAL').split()
+            D += [[float(d) for d in dist] + [0.0, 0.0]]
 
-        trans = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('POSITION').split()
-        T += [[float(t)/1000 for t in trans]]
+            # Intrinsic parameters: focal length and principal point (with offset)
+            fu = float(cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('FOCAL_LENGTH'))
+            fv = fu / float(cam_elem.attrib.get('PIXEL_ASPECT_RATIO'))
+            cam_center = [float(c) for c in cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('PRINCIPAL_POINT').split()]
+            sensor_size = [float(t) for t in cam_elem.attrib.get('SENSOR_SIZE').split()]
+            roi_offset = [(sensor_size[i] - img_res[i])/2 for i in range(2)]
+            cu, cv = [cam_center[i] - roi_offset[i] for i in range(2)]
+            K += [np.array([fu, 0., cu, 0., fv, cv, 0., 0., 1.]).reshape(3,3)]
 
-    # Camera names by natural order
-    C_vid_id = [v for v in vid_id if 'video' in root.findall('Camera')[v].attrib.get('TYPE', '').lower()]
-    C_vid = [root.findall('Camera')[v].attrib.get('DEVICEID') for v in C_vid_id]
-    C = sorted(C_vid, key=natural_sort_key)
-    C_id_sorted = [i for v_sorted in C for i,v in enumerate(root.findall('Camera')) if v.attrib.get('DEVICEID')==v_sorted]
-    S = [S[c] for c in C_id_sorted]
-    D = [D[c] for c in C_id_sorted]
-    K = [K[c] for c in C_id_sorted]
-    R = [R[c] for c in C_id_sorted]
-    T = [T[c] for c in C_id_sorted]
+            # Extrinsic parameters: rotation matrix and translation vector
+            rot = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('ORIENTATION').split()
+            R_quat = [float(r) for r in rot]
+            R_mat = quat2mat(R_quat, scalar_idx=3)
+            R += [R_mat]
+
+            trans = cam_elem.findall('KeyFrames/KeyFrame')[0].attrib.get('POSITION').split()
+            T += [[float(t)/1000 for t in trans]]
+
+    # Camera by natural order of their names
+    sorted_cams = sorted(zip(C, S, D, K, R, T), key=natural_sort_key)
+    C, S, D, K, R, T = zip(*sorted_cams)
 
     return ret, C, S, D, K, R, T
 
@@ -471,8 +486,8 @@ def calib_calc_fun(calib_dir, intrinsics_config_dict, extrinsics_config_dict, sa
 
     INPUTS:
     - calib_dir: directory containing intrinsic and extrinsic folders, each populated with camera directories
-    - intrinsics_config_dict: dictionary of intrinsics parameters (overwrite_intrinsics, show_detection_intrinsics, intrinsics_extension, extract_every_N_sec, intrinsics_corners_nb, intrinsics_square_size, intrinsics_marker_size, intrinsics_aruco_dict)
-    - extrinsics_config_dict: dictionary of extrinsics parameters (calculate_extrinsics, show_detection_extrinsics, extrinsics_extension, extrinsics_corners_nb, extrinsics_square_size, extrinsics_marker_size, extrinsics_aruco_dict, object_coords_3d)
+    - intrinsics_config_dict: dictionary of intrinsics parameters
+    - extrinsics_config_dict: dictionary of extrinsics parameters
 
     OUTPUTS:
     - ret: residual reprojection error in _px_: list of floats
@@ -490,7 +505,7 @@ def calib_calc_fun(calib_dir, intrinsics_config_dict, extrinsics_config_dict, sa
     # retrieve intrinsics if calib_file found and if overwrite_intrinsics=False
     try:
         calib_files = list(Path(calib_dir).glob('*.toml'))
-        calib_file = max(calib_files, key=lambda f: f.stat().st_ctime) # lastly created calibration file
+        calib_file = max(calib_files, key=lambda f: f.stat().st_mtime) # lastly created calibration file
     except:
         pass
     if not overwrite_intrinsics and 'calib_file' in locals():
@@ -498,11 +513,19 @@ def calib_calc_fun(calib_dir, intrinsics_config_dict, extrinsics_config_dict, sa
         logging.info(f'\nRetrieving intrinsic parameters from file. Set "overwrite_intrinsics" to true in Config.toml to recalculate them.')
         calib_data = rtoml.load(Path(calib_file))
 
+        # Flatten camera names
+        if "cameras" in calib_data:
+            calib_data = {f"cameras.{k}": v for k, v in calib_data["cameras"].items()}
+
+        # Retrieve data
         ret, C, S, D, K, R, T = [], [], [], [], [], [], []
         for cam in calib_data:
             if cam != 'metadata':
                 ret += [0.0]
-                C += [calib_data[cam]['name']]
+                if 'name' in calib_data[cam]:
+                    C += [calib_data[cam]['name']]
+                else:
+                    C += [cam.replace('.','_')]
                 S += [calib_data[cam]['size']]
                 K += [np.array(calib_data[cam]['matrix'])]
                 D += [calib_data[cam]['distortions']]
@@ -525,7 +548,10 @@ def calib_calc_fun(calib_dir, intrinsics_config_dict, extrinsics_config_dict, sa
     if calculate_extrinsics:
         logging.info(f'\nCalculating extrinsic parameters...')
         # check that the number of cameras is consistent
-        nb_cams_extrinsics = [max(len(fold),len(files)) for path, fold, files in os.walk(Path(calib_dir) / 'extrinsics')][0]
+        extrinsics_dir = Path(calib_dir) / 'extrinsics'
+        fold = [p for p in extrinsics_dir.iterdir() if p.is_dir()]
+        media_files = [p for p in extrinsics_dir.iterdir() if is_video_file(p)]
+        nb_cams_extrinsics = max(len(fold), len(media_files))
         if nb_cams_intrinsics != nb_cams_extrinsics:
             raise Exception(f'Error: The number of cameras is not consistent:\
                     Found {nb_cams_intrinsics} cameras based on the number of intrinsic folders or on calibration file data,\
@@ -651,6 +677,7 @@ def create_image_labels(img_path, imgpoints, calib_dir, prefix, reprojected_poin
     cv2.putText(img, '  Reprojected object points', (20, 60), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
 
     if show:
+        from PIL import Image
         im_pil = Image.fromarray(img)
         plt.rcParams['toolbar'] = 'None'
         fig = plt.figure()
@@ -676,7 +703,7 @@ def create_image_labels(img_path, imgpoints, calib_dir, prefix, reprojected_poin
     return save_path
 
 
-def calibrate_intrinsics(calib_dir, intrinsics_config_dict, save_debug_images=True, extrinsics_method='scene'):
+def calibrate_intrinsics(calib_dir, intrinsics_config_dict, save_debug_images=True):
     '''
     Calculate intrinsic parameters
     from images or videos of a checkerboard
@@ -684,26 +711,31 @@ def calibrate_intrinsics(calib_dir, intrinsics_config_dict, save_debug_images=Tr
 
     INPUTS:
     - calib_dir: directory containing intrinsic and extrinsic folders, each populated with camera directories
-    - intrinsics_config_dict: dictionary of intrinsics parameters (overwrite_intrinsics, show_detection_intrinsics, intrinsics_extension, extract_every_N_sec, intrinsics_corners_nb, intrinsics_square_size, intrinsics_marker_size, intrinsics_aruco_dict)
+    - intrinsics_config_dict: dictionary of intrinsics parameters
 
     OUTPUTS:
     - D: distorsion: list of arrays of floats
     - K: intrinsic parameters: list of 3x3 arrays of floats
     '''
 
+    intrinsics_dir = Path(calib_dir) / 'intrinsics'
     try:
-        intrinsics_cam_listdirs_names = sorted(next(os.walk(Path(calib_dir) / 'intrinsics'))[1])
+        root, fold, files = next(os.walk(intrinsics_dir))
+        intrinsics_cam_listdirs_names = sorted(fold or [f for f in files if is_video_file(os.path.join(root, f))],
+                                                key=natural_sort_key)
     except StopIteration:
-        logging.exception(f'Error: No {Path(calib_dir) / "intrinsics"} folder found.')
-        raise Exception(f'Error: No {Path(calib_dir) / "intrinsics"} folder found.')
-    intrinsics_extension = intrinsics_config_dict.get('intrinsics_extension', 'jpg')
+        logging.exception(f'Error: No {intrinsics_dir} folder found.')
+        raise Exception(f'Error: No {intrinsics_dir} folder found.')
     extract_every_N_sec = intrinsics_config_dict.get('extract_every_N_sec', 1)
     overwrite_extraction = False
     show_detection_intrinsics = intrinsics_config_dict.get('show_detection_intrinsics', True)
-    intrinsics_corners_nb = intrinsics_config_dict.get('intrinsics_corners_nb', [4, 7])
-    intrinsics_square_size = intrinsics_config_dict.get('intrinsics_square_size', 60) / 1000 # convert to meters
+    board_type = intrinsics_config_dict.get('board_type', 'charuco')
+    corners_nb = intrinsics_config_dict.get('corners_nb', [4, 7])
+    square_size = intrinsics_config_dict.get('square_size', 60) / 1000 # convert to meters
+    marker_size = square_size * 0.75 # as in calib.io. detectBoard is very tolerant, and work with marker_size = square_size * 0.15 to -0.9
+    marker_resolution = str(intrinsics_config_dict.get('marker_resolution', 5)) # resolution of the aruco marker
     ret, C, S, D, K, R, T = [], [], [], [], [], [], []
-
+    
     # Load clicked image points if exist
     img_pts_path = Path(calib_dir) / f'Image_points.json'
     if Path(img_pts_path).exists():
@@ -711,60 +743,76 @@ def calibrate_intrinsics(calib_dir, intrinsics_config_dict, save_debug_images=Tr
             imgp_data = json.load(f)
         image_points = imgp_data['intrinsics']
 
-    for i,cam in enumerate(intrinsics_cam_listdirs_names):
+    for cam in intrinsics_cam_listdirs_names:
+        cam_dir_or_vid = intrinsics_dir / cam
+        cam_name = Path(cam).stem
+        cam_dir = intrinsics_dir / cam_name
+
         # Prepare object points
-        objp = np.zeros((intrinsics_corners_nb[0]*intrinsics_corners_nb[1],3), np.float32) 
-        objp[:,:2] = np.mgrid[0:intrinsics_corners_nb[0],0:intrinsics_corners_nb[1]].T.reshape(-1,2)
-        objp[:,:2] = objp[:,0:2]*intrinsics_square_size
+        objp = np.zeros((corners_nb[0]*corners_nb[1],3), np.float32) 
+        objp[:,:2] = np.mgrid[0:corners_nb[0],0:corners_nb[1]].T.reshape(-1,2)
+        objp[:,:2] = objp[:,0:2]*square_size
         objpoints = [] # 3d points in world space
         imgpoints = [] # 2d points in image plane
 
         logging.info(f'\nCamera {cam}:')
-        img_vid_files = list((Path(calib_dir) / 'intrinsics' / cam).glob(f'*.{intrinsics_extension}'))
-        if len(img_vid_files) == 0:
-            logging.exception(f'The folder {Path(calib_dir) / "intrinsics" / cam} does not exist or does not contain any files with extension .{intrinsics_extension}.')
-            raise ValueError(f'The folder {Path(calib_dir) / "intrinsics" / cam} does not exist or does not contain any files with extension .{intrinsics_extension}.')
-        img_vid_files = sorted(img_vid_files, key=lambda c: [int(n) for n in re.findall(r'\d+', str(c))]) #sorting paths with numbers
+        if is_video_file(cam_dir_or_vid):
+            extract_frames(cam_dir_or_vid, extract_every_N_sec, overwrite_extraction, cam_dir)
+            img_vid_files = sorted(cam_dir.glob('*.png'), key=natural_sort_key)
         
-        # extract frames from video if video
-        try:
-            cap = cv2.VideoCapture(img_vid_files[0])
-            cap.read()
-            if cap.read()[0] == False:
-                raise
-            extract_frames(img_vid_files[0], extract_every_N_sec, overwrite_extraction)
-            img_vid_files = list((Path(calib_dir) / 'intrinsics' / cam).glob('*.png'))
-            img_vid_files = sorted(img_vid_files, key=lambda c: [int(n) for n in re.findall(r'\d+', str(c))])
-        except:
-            pass
+        elif cam_dir_or_vid.is_dir():
+            img_vid_files = sorted([f for f in (cam_dir_or_vid).glob('*') 
+                                    if is_image_file(f) or is_video_file(f)],
+                                    key=natural_sort_key)
+            if not img_vid_files:
+                logging.exception(f'No images or videos in {cam_dir_or_vid}')
+                raise ValueError(f'No images or videos in {cam_dir_or_vid}')
+            if is_video_file(img_vid_files[0]):
+                extract_frames(img_vid_files[0], extract_every_N_sec, overwrite_extraction)
+                img_vid_files = sorted(cam_dir_or_vid.glob('*.png'), key=natural_sort_key)
+
+        else:
+            logging.exception(f'{cam_dir_or_vid} is neither a file nor a folder.')
+            raise FileNotFoundError(f'{cam_dir_or_vid} is neither a file nor a folder.')
 
         # find corners
         for img_path in img_vid_files:
-            cam_name = Path(img_path).name
             if show_detection_intrinsics == True:
                 # If previously labeled points exist, check if they are satisfying
                 if 'image_points' in locals():
                     imgp = next((entry['image_points_2d'] for entry in image_points if entry["cam_name"] == cam_name), [])
-                    objp = next((entry['object_points_3d'] for entry in image_points if entry["cam_name"] == cam_name), [])
-                    if len(imgp) > 0 and len(objp) > 0:
+                    objp_ = next((entry['object_points_3d'] for entry in image_points if entry["cam_name"] == cam_name), [])
+                    if len(objp_) > 0:
+                        objp = objp_
+                    if len(imgp) > 0:
                         # recalculate reprojected points
                         imgp = np.array(imgp).reshape(-1, 2)
                         objp = np.array(objp).reshape(-1, 3)
                         saved_img_path = create_image_labels(img_path, imgp, calib_dir, 'int', reprojected_points=None, show=True, save=save_debug_images)
                         # Are you satisfied? If so, add to imgpoints and continue; else, redo detection
-                        root = ctk.CTk()
-                        root.withdraw()
-                        satisfied = messagebox.askyesno("Loaded previous labels", f"Are you satisfied with the previous labels for {cam_name}?")
-                        root.destroy()
+                        satisfied = show_qt_message_box(
+                            "Loaded previous labels", 
+                            f"Are you satisfied with the previous labels for {cam_name}?",
+                            question=True
+                        )
                         if satisfied:
                             imgpoints.append(imgp)
                             objpoints.append(objp)
                             plt.close('all')
                             continue
-
-                # If not satisfied, tries to detect corners
                 plt.close('all')
-                imgp_confirmed, objp_confirmed = findCorners(img_path, intrinsics_corners_nb, objp=objp, show=show_detection_intrinsics)
+
+            # If not satisfied, tries to detect corners
+            imgp_objp_confirmed = findCorners(img_path, corners_nb, objp=objp, show=show_detection_intrinsics,
+                                                board_type=board_type,
+                                                aruco_marker_size=marker_size, aruco_square_size=square_size, aruco_marker_resolution=marker_resolution)
+
+            # Append valid img and obj points, save detection image and JSON
+            if imgp_objp_confirmed is not None:
+                if isinstance(imgp_objp_confirmed, tuple):
+                    imgp_confirmed, objp_confirmed = imgp_objp_confirmed
+                else:
+                    imgp_confirmed, objp_confirmed = imgp_objp_confirmed, objp
                 if isinstance(imgp_confirmed, np.ndarray):
                     imgpoints.append(imgp_confirmed)
                     objpoints.append(objp_confirmed)
@@ -772,16 +820,6 @@ def calibrate_intrinsics(calib_dir, intrinsics_config_dict, save_debug_images=Tr
                     saved_img_path = create_image_labels(img_path, imgp_confirmed, calib_dir, 'int', reprojected_points=None, show=False, save=save_debug_images)
                     append_points_to_json(calib_dir, 'intrinsics', cam_name, imgp_confirmed)
                     append_points_to_json(calib_dir, 'intrinsics', cam_name, objp_confirmed, object_points=True)
-            else:
-                imgp = findCorners(img_path, intrinsics_corners_nb, objp=objp, show=show_detection_intrinsics)
-                if isinstance(imgp, np.ndarray):
-                    imgpoints.append(imgp)
-                    objpoints.append(objp)
-                    # Save detection image and JSON
-                    saved_img_path = create_image_labels(img_path, imgp, calib_dir, 'int', reprojected_points=None, show=False, save=save_debug_images)
-                    append_points_to_json(calib_dir, 'intrinsics', cam_name, imgp)
-                    append_points_to_json(calib_dir, 'intrinsics', cam_name, objp, object_points=True)
-
 
         if len(imgpoints) < 10:
             logging.info(f'Corners were detected only on {len(imgpoints)} images for camera {cam}. Calibration of intrinsic parameters may not be accurate with fewer than 10 good images of the board.')
@@ -814,7 +852,7 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
 
     INPUTS:
     - calib_dir: directory containing intrinsic and extrinsic folders, each populated with camera directories
-    - extrinsics_config_dict: dictionary of extrinsics parameters (extrinsics_method, calculate_extrinsics, show_detection_extrinsics, extrinsics_extension, extrinsics_corners_nb, extrinsics_square_size, extrinsics_marker_size, extrinsics_aruco_dict, object_coords_3d)
+    - extrinsics_config_dict: dictionary of extrinsics parameters
 
     OUTPUTS:
     - R: extrinsic rotation: list of arrays of floats (Rodrigues)
@@ -822,28 +860,27 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
     '''
 
     extrinsics_method = extrinsics_config_dict.get('extrinsics_method', 'scene')
-    extrinsics_extension = extrinsics_config_dict.get('extrinsics_extension', 'png')
     show_reprojection_error = extrinsics_config_dict.get('show_reprojection_error', True)
-    board_position = extrinsics_config_dict.get('board', {}).get('board_position', 'vertical')
-    extrinsics_corners_nb = extrinsics_config_dict.get('board', {}).get('extrinsics_corners_nb', [4, 7])
-    extrinsics_square_size = extrinsics_config_dict.get('board', {}).get('extrinsics_square_size', 60) / 1000 # convert to meters
-    object_coords_3d = np.array(extrinsics_config_dict.get('scene', {}).get('object_coords_3d', []), np.float32)
-    # backwards compatibility
-    if not extrinsics_extension: 
-        extrinsics_extension = extrinsics_config_dict.get('extrinsics_extension', 'png')
-    if not show_reprojection_error:
-        show_reprojection_error = extrinsics_config_dict.get('board', {}).get('show_reprojection_error', True)
 
-    try:
-        img_vid_files = sorted((Path(calib_dir) / 'extrinsics').glob(f'*/*.{extrinsics_extension}'))
-        if len(img_vid_files) == 0:
-            img_vid_files = sorted((Path(calib_dir) / 'extrinsics').glob(f'*.{extrinsics_extension}'))
-        if len(img_vid_files) == 0:
-            raise
-        img_vid_files = sorted(img_vid_files, key=lambda c: [int(n) for n in re.findall(r'\d+', str(c))]) #sorting paths with numbers
-    except StopIteration:
-        logging.exception(f'Error: The {Path(calib_dir) / "extrinsics"} folder does not exist or does not contain any files with extension .{extrinsics_extension}.')
-        raise Exception(f'Error: The {Path(calib_dir) / "extrinsics"} folder does not exist or does not contain any files with extension .{extrinsics_extension}.')
+    extrinsics_scene = extrinsics_config_dict.get('scene', {})
+    extrinsics_static = extrinsics_config_dict.get('static', {})
+    extrinsics_charuco = extrinsics_config_dict.get('charuco', {})
+    extrinsics_keypoints = extrinsics_config_dict.get('keypoints', {})
+
+    # Detect images or videos in the extrinsics folder, sorted by camera name
+    extrinsics_dir = Path(calib_dir) / 'extrinsics'
+    img_vid_files = sorted(
+        [f for f in (extrinsics_dir).glob('*/*') if f.is_file() and (is_image_file(f) or is_video_file(f))],
+        key=lambda c: [int(n) for n in re.findall(r'\d+', c.name)],
+    )
+    if not img_vid_files:
+        img_vid_files = sorted(
+            [f for f in (extrinsics_dir).glob('*') if f.is_file() and (is_image_file(f) or is_video_file(f))],
+            key=lambda c: [int(n) for n in re.findall(r'\d+', c.name)],
+        )
+    if not img_vid_files:
+        logging.exception(f'No images or videos found in the folder {extrinsics_dir}.')
+        raise FileNotFoundError(f'No images or videos found in the folder {extrinsics_dir}.')
 
     # Load clicked image points if exist
     img_pts_path = Path(calib_dir) / f'Image_points.json'
@@ -853,31 +890,37 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
         image_points = imgp_data.get('extrinsics', [])
 
     ret, R, T = [], [], []
-    if extrinsics_method in {'board', 'static_board', 'scene'}:
+    if extrinsics_method in {'scene', 'chess_static', 'charuco_static'}:
+        board_position = extrinsics_static.get('board_position', 'vertical')
+        corners_nb = extrinsics_static.get('corners_nb', [4, 7])
+        square_size = extrinsics_static.get('square_size', 60) / 1000 # convert to meters
+        marker_size = square_size * 0.75 # as in calib.io. detectBoard is very tolerant, and work with marker_size = square_size * 0.15 to -0.9
+        marker_resolution = str(extrinsics_static.get('marker_resolution', 5)) # resolution of the aruco marker
+
         # Define 3D object points
-        if extrinsics_method in ('board', 'static_board'):
+        if extrinsics_method == 'scene':
+            object_coords_3d = np.array(extrinsics_scene.get('object_coords_3d', []), dtype=np.float32)
+        elif extrinsics_method in ('chess_static', 'charuco_static'):
+            board_type = 'chess' if extrinsics_method == 'chess_static' else 'charuco'
             if not board_position:
                 logging.warning('board_position not defined in Config.toml. Defaulting to "vertical".')
                 board_position = 'vertical'
-            object_coords_3d = np.zeros((extrinsics_corners_nb[0] * extrinsics_corners_nb[1], 3), np.float32)
+            object_coords_3d = np.zeros((corners_nb[0] * corners_nb[1], 3), np.float32)
             if board_position == 'horizontal':
-                object_coords_3d[:, :2] = np.mgrid[0:extrinsics_corners_nb[0], 0:extrinsics_corners_nb[1]].T.reshape(-1, 2)
-                object_coords_3d[:, :2] = object_coords_3d[:, 0:2] * extrinsics_square_size
-            elif board_position == 'vertical':
-                object_coords_3d[:, [0,2]] = np.mgrid[0:extrinsics_corners_nb[0], 0:extrinsics_corners_nb[1]][::-1].T.reshape(-1, 2)
-                object_coords_3d[:, [0,2]] = object_coords_3d[:, [0,2]] * extrinsics_square_size
-            else:
-                logging.exception('board_position should be "horizontal" or "vertical".')
-                raise ValueError('board_position should be "horizontal" or "vertical".')
+                object_coords_3d[:, :2] = np.mgrid[0:corners_nb[1],0:corners_nb[0]].T.reshape(-1, 2)
+                object_coords_3d[:, :2] = object_coords_3d[:, 0:2] * square_size + square_size
+            else: # 'vertical'
+                object_coords_3d[:, [0,2]] = np.mgrid[0:corners_nb[1], 0:corners_nb[0]][::-1].T.reshape(-1, 2)
+                object_coords_3d[:, [0,2]] = object_coords_3d[:, [0,2]] * square_size + square_size
                 
         # Save reference 3D coordinates as trc
-        obj_pts_path = Path(calib_dir) / f'Object_points.trc'
+        obj_pts_path = Path(calib_dir) / f'Calibration_points.trc'
         trc_write(object_coords_3d, obj_pts_path)
 
         # Create or update clicked image points file
         for i, img_vid_file in enumerate(img_vid_files):
-            cam_name = Path(img_vid_file).name
-            logging.info(f'\nCamera {cam_name}:')
+            cam_name = Path(img_vid_file).stem
+            logging.info(f'Camera {cam_name}:')
            
             # extract frames from image, or from video if imread is None
             img = cv2.imread(img_vid_file)
@@ -891,8 +934,10 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
             # If previously labeled points exist, check if they are satisfying
             if 'image_points' in locals():
                 imgp = next((entry['image_points_2d'] for entry in image_points if entry["cam_name"] == cam_name), [])
-                objp = next((entry['object_points_3d'] for entry in image_points if entry["cam_name"] == cam_name), [])
-                if len(imgp) > 0 and len(objp) > 0:
+                objp_ = next((entry['object_points_3d'] for entry in image_points if entry["cam_name"] == cam_name), [])
+                if len(objp_) > 0:
+                    objp = objp_
+                if len(imgp) > 0:
                     # recalculate reprojected points
                     objp = np.array(objp).reshape(-1, 3)
                     imgp = np.array(imgp).reshape(-1, 2)
@@ -909,15 +954,16 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
                     saved_img_path = create_image_labels(img_vid_file, imgp, calib_dir, 'ext', reprojected_points=proj_obj_all, show=show_reprojection_error, save=save_debug_images)
 
                     # Are you satisfied? If so, add to imgpoints and continue; else, redo detection
-                    root = ctk.CTk()
-                    root.withdraw()
-                    satisfied = messagebox.askyesno("Loaded previous labels", f"Are you satisfied with the previous labels for {cam_name}?")
-                    root.destroy()
+                    satisfied = show_qt_message_box(
+                        "Loaded previous labels", 
+                        f"Are you satisfied with the previous labels for {cam_name}?",
+                        question=True
+                    )
                     if satisfied:
                         # Calculate reprojection error
                         imgp = np.array(imgp).reshape(-1, 2)
                         imgp_to_objreproj_dist = [euclidean_distance(proj_obj[n], imgp[n]) for n in range(len(proj_obj))]
-                        rms_px = np.sqrt(np.sum([d**2 for d in imgp_to_objreproj_dist]))
+                        rms_px = np.sqrt(np.sum([d**2 for d in imgp_to_objreproj_dist]) / len(imgp_to_objreproj_dist))
                         ret.append(rms_px)
                         R.append(r)
                         T.append(t)
@@ -927,11 +973,15 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
                         plt.close('all')
 
             # if len(imgp) == 0 or not satisfied:
-            if extrinsics_method in ('board', 'static_board'):
-                imgp, objp = findCorners(img_vid_file, extrinsics_corners_nb, objp=object_coords_3d, show=show_reprojection_error)
+            if extrinsics_method in ('charuco_static', 'chess_static'):
+                imgp, objp = findCorners(img_vid_file, corners_nb, objp=object_coords_3d, show=show_reprojection_error,
+                                         board_type=board_type,
+                                         aruco_marker_size=marker_size, aruco_square_size=square_size, aruco_marker_resolution=marker_resolution)
+                if board_position == 'vertical':
+                    objp = objp[:, [1,2,0]]
                 if len(imgp) == 0:
-                    logging.exception('No corners found. Set "show_detection_extrinsics" to true to click corners by hand, or change extrinsic_board_type to "scene"')
-                    raise ValueError('No corners found. Set "show_detection_extrinsics" to true to click corners by hand, or change extrinsic_board_type to "scene"')
+                    logging.exception('No corners found. Set "show_detection_extrinsics" to true to click corners by hand or use a different calibration method.')
+                    raise ValueError('No corners found. Set "show_detection_extrinsics" to true to click corners by hand or use a different calibration method.')
 
             elif extrinsics_method == 'scene':
                 imgp, objp = imgp_objp_visualizer_clicker(img, imgp=[], objp=object_coords_3d, img_path=img_vid_files[i])
@@ -965,13 +1015,16 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
 
             # Calculate reprojection error
             imgp_to_objreproj_dist = [euclidean_distance(proj_obj[n], imgp[n]) for n in range(len(proj_obj))]
-            rms_px = np.sqrt(np.sum([d**2 for d in imgp_to_objreproj_dist]))
+            rms_px = np.sqrt(np.sum([d**2 for d in imgp_to_objreproj_dist]) / len(imgp_to_objreproj_dist))
             ret.append(rms_px)
             R.append(r)
             T.append(t)
         
+    elif extrinsics_method == 'charuco':
+        raise NotImplementedError('Calibration with a moving charuco board has not been integrated yet.')
+
     elif extrinsics_method == 'keypoints':
-        raise NotImplementedError('This has not been integrated yet.')
+        raise NotImplementedError('Calibration based on keypoints has not been integrated yet.')
     
     else:
         raise ValueError('Wrong value for extrinsics_method')
@@ -979,9 +1032,52 @@ def calibrate_extrinsics(calib_dir, extrinsics_config_dict, C, S, K, D, save_deb
     return ret, C, S, D, K, R, T
 
 
-def findCorners(img_path, corner_nb, objp=[], show=True):
+def draw_charuco_corners_like_chessboard(img, charuco_corners, charuco_ids, board, radius=8, thickness=1):
     '''
-    Find corners in the photo of a checkerboard.
+    Draws charuco corners styled like cv2.drawChessboardCorners:
+    - one color per row, cycling through OpenCV's exact 7-color BGR palette
+    - each corner marked with a circle + an X (45°-rotated cross)
+    - no squares, no IDs, no connecting lines
+    '''
+
+    _LINE_COLORS_BGR = [
+        (0, 0, 255),      # red
+        (0, 128, 255),    # orange
+        (0, 200, 200),    # yellow
+        (0, 255, 0),      # green
+        (200, 200, 0),    # cyan-ish
+        (255, 0, 0),      # blue
+        (255, 0, 255),    # magenta
+    ]
+
+    if charuco_corners is None or charuco_ids is None:
+        return img
+
+    out = img.copy()
+    board_size = board.getChessboardSize()   # (squaresX, squaresY)
+    n_cols = board_size[0] - 1               # inner-corner columns
+
+    for corner, cid in zip(charuco_corners, charuco_ids.flatten()):
+        row = int(cid) // n_cols
+        color = _LINE_COLORS_BGR[row % len(_LINE_COLORS_BGR)]
+
+        x, y = corner.ravel()
+        cx, cy = int(round(x)), int(round(y))
+
+        # Circle
+        cv2.circle(out, (cx, cy), radius, color, thickness, cv2.LINE_AA)
+
+        # 45°-rotated cross (an "X"), sized to fit inside the circle
+        d = int(round(radius * 0.7071))  # radius / sqrt(2)
+        cv2.line(out, (cx - d, cy - d), (cx + d, cy + d), color, thickness, cv2.LINE_AA)
+        cv2.line(out, (cx - d, cy + d), (cx + d, cy - d), color, thickness, cv2.LINE_AA)
+
+    return out
+
+
+def findCorners(img_path, corner_nb, objp=[], show=True, board_type='charuco', aruco_square_size=0.06, aruco_marker_size=0.045, aruco_marker_resolution=4):
+    '''
+    Find corners in the photo of a checkerboard or CharUco board.
     Press 'Y' to accept detection, 'N' to dismiss this image, 'C' to click points by hand.
     Left click to add a point, right click to remove the last point.
     Use mouse wheel to zoom in and out and to pan.
@@ -994,9 +1090,12 @@ def findCorners(img_path, corner_nb, objp=[], show=True):
     
     INPUTS:
     - img_path: path to image (or video)
-    - corner_nb: [H, W] internal corners in checkerboard: list of two integers [4,7]
-    - optional: show: choose whether to show corner detections
+    - corner_nb: [H, W] internal corners in checkerboard or CharUco board: list of two integers [4,7]
     - optional: objp: array [3d corner coordinates]
+    - optional: show: choose whether to show corner detections
+    - optional: board_type: 'chess' or 'charuco'
+    - optional for charuco: aruco_square_size: square size in mm
+    - optional for charuco: aruco_marker_resolution: resolution of the marker (e.g. 4 for 'DICT_4X4_50', 'DICT_4X4_100', ...)
 
     OUTPUTS:
     - imgp_confirmed: array of [[2d corner coordinates]]
@@ -1008,38 +1107,97 @@ def findCorners(img_path, corner_nb, objp=[], show=True):
     img = cv2.imread(img_path)
     if img is None:
         cap = cv2.VideoCapture(img_path)
-        ret, img = cap.read()
+        _, img = cap.read()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
     # Find corners
-    ret, corners = cv2.findChessboardCorners(gray, corner_nb, None)
-    # If corners are found, refine corners
-    if ret == True: 
-        imgp = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
-        logging.info(f'{Path(img_path).name}: Corners found.')
-        
-        if show:
-            # Draw corners
-            cv2.drawChessboardCorners(img, corner_nb, imgp, ret)
-            # Add corner index 
-            for i, corner in enumerate(imgp):
-                if i in [0, corner_nb[0]-1, corner_nb[0]*(corner_nb[1]-1), corner_nb[0]*corner_nb[1] -1]:
-                    x, y = corner.ravel()
-                    cv2.putText(img, str(i+1), (int(x)-5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 7) 
-                    cv2.putText(img, str(i+1), (int(x)-5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, .8, (0,0,0), 2) 
+    if board_type == 'charuco':
+        # Test all available dictionaries with the given resolution until one works
+        for code_nb in [50, 100, 250, 1000]:
+            try:
+                aruco_dict_name = f'DICT_{aruco_marker_resolution}X{aruco_marker_resolution}_{code_nb}'
+                aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, aruco_dict_name))
+                board = cv2.aruco.CharucoBoard((corner_nb[1]+1, corner_nb[0]+1), aruco_square_size, aruco_marker_size, aruco_dict)
+                detector_params = cv2.aruco.DetectorParameters()
+                detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+                detector = cv2.aruco.CharucoDetector(board, detectorParams=detector_params)
+                charuco_corners, charuco_ids, _, _ = detector.detectBoard(gray)
+                if charuco_ids is not None and len(charuco_ids) >= 4:
+                    ret = True
+                    break
+                else:
+                    ret = False
+            except: # Try next one
+                ret = False
+                continue
+
+        # If corners are found # Subpixel refinement included in CharUcoDetector
+        if ret:
+            imgp = charuco_corners  # shape (N, 1, 2)
+            objp = board.getChessboardCorners()[charuco_ids.flatten()]  # objp needed because we may detect a partial board
+            logging.info(f'{Path(img_path).name}: {len(charuco_ids)} CharUco corners found.')
+
+            if show:
+                # Draw detected CharUco corners
+                charuco_corners, charuco_ids = charuco_corners.reshape(-1, 1, 2), charuco_ids.reshape(-1, 1)
+                img = draw_charuco_corners_like_chessboard(img, charuco_corners, charuco_ids, board)
+
+                # Add corner index
+                ids_flat = charuco_ids.flatten()
+                rows = ids_flat // corner_nb[1]
+                first_row_idx = np.where(rows == rows.min())[0]
+                last_row_idx  = np.where(rows == rows.max())[0]
+                first_row_idx = first_row_idx[np.argsort(ids_flat[first_row_idx])]
+                last_row_idx  = last_row_idx[np.argsort(ids_flat[last_row_idx])]
+                targets = [first_row_idx[0], first_row_idx[-1], last_row_idx[0], last_row_idx[-1]]
+                for i in targets:
+                    x, y = charuco_corners[i].ravel()
+                    label = str(ids_flat[i] + 1)
+                    for dx, dy in outline_offsets:
+                        cv2.putText(img, label, (int(x)-5+dx, int(y)-5+dy), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                    cv2.putText(img, label, (int(x)-5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+
+                # Visualizer and key press event handler
+                for var_to_delete in ['imgp_confirmed', 'objp_confirmed']:
+                    if var_to_delete in globals():
+                        del globals()[var_to_delete]
+                imgp_objp_confirmed = imgp_objp_visualizer_clicker(img, imgp=imgp, objp=objp, img_path=img_path)
+            else:
+                imgp_objp_confirmed = imgp, objp
+
+    elif board_type == 'chess':
+        ret, corners = cv2.findChessboardCorners(gray, corner_nb, None)
+        # If corners are found, refine corners
+        if ret: 
+            imgp = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
+            logging.info(f'{Path(img_path).name}: Chessboard corners found.')
             
-            # Visualizer and key press event handler
-            for var_to_delete in ['imgp_confirmed', 'objp_confirmed']:
-                if var_to_delete in globals():
-                    del globals()[var_to_delete]
-            imgp_objp_confirmed = imgp_objp_visualizer_clicker(img, imgp=imgp, objp=objp, img_path=img_path)
-        else:
-            imgp_objp_confirmed = imgp
-            
+            if show:
+                # Draw corners
+                cv2.drawChessboardCorners(img, corner_nb, imgp, ret)
+                # Add corner index 
+                for i, corner in enumerate(imgp):
+                    if i in [0, corner_nb[0]-1, corner_nb[0]*(corner_nb[1]-1), corner_nb[0]*corner_nb[1] -1]:
+                        x, y = corner.ravel()
+                        for dx, dy in outline_offsets:
+                            cv2.putText(img, str(i+1), (int(x)-5+dx, int(y)-5+dy), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                        cv2.putText(img, str(i+1), (int(x)-5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, .8, (0,0,0), 1, lineType=cv2.LINE_AA)
+
+                # Visualizer and key press event handler
+                for var_to_delete in ['imgp_confirmed', 'objp_confirmed']:
+                    if var_to_delete in globals():
+                        del globals()[var_to_delete]
+                imgp_objp_confirmed = imgp_objp_visualizer_clicker(img, imgp=imgp, objp=objp, img_path=img_path)
+            else:
+                imgp_objp_confirmed = imgp
+
+    else:
+        logging.exception(f'Wrong value for board_type: {board_type}. Should be "chess" or "charuco".')
+        raise ValueError(f'Wrong value for board_type: {board_type}. Should be "chess" or "charuco".')
 
     # If corners are not found, dismiss or click points by hand
-    else:
+    if not ret:
         if show:
             # Visualizer and key press event handler
             logging.info(f'{Path(img_path).name}: Corners not found: please label them by hand.')
@@ -1077,6 +1235,7 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
     - imgp_confirmed: image points that have been correctly identified. array of [[2d corner coordinates]]
     - only if objp!=[]: objp_confirmed: array of [3d corner coordinates]
     '''
+
     global old_image_path
     old_image_path = img_path
                                  
@@ -1174,15 +1333,15 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
                     fig_3d.canvas.draw()
 
                     # Ask for confirmation
-                    root = ctk.CTk()
-                    root.withdraw()
-                    response = messagebox.askyesno("Confirm labeling", f"Are you satisfied with your labeling for {Path(img_path).name}?")
-
-                    root.destroy()
+                    satisfied = show_qt_message_box(
+                        "Confirm labeling", 
+                        f"Are you satisfied with your labeling for {Path(img_path).name}?",
+                        question=True
+                    )
                     # Disable event picking
                     fig.canvas.callbacks.blocked = True
                     # Confirmed
-                    if response == True:
+                    if satisfied == True:
                         plt.close('all')
                         # if all objp have been clicked or indicated as not visible, close all
                         objp_confirmed = np.array([[objp[count]] if 'objp_confirmed' not in globals() else objp_confirmed+[objp[count]]][0])[:-1]
@@ -1245,13 +1404,15 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
                     ax_3d.scatter(*objp[count], marker='o', color='g')
                     fig_3d.canvas.draw()
                     # Ask for confirmation
-                    root = ctk.CTk()
-                    root.withdraw()
-                    response = messagebox.askyesno("Confirm labeling", f"Are you satisfied with your labeling for {Path(img_path).name}?")
+                    satisfied = show_qt_message_box(
+                        "Confirm labeling",
+                        f"Are you satisfied with your labeling for {Path(img_path).name}?",
+                        question=True
+                    )
                     # Disable event picking
                     fig.canvas.callbacks.blocked = True
                     # Confirmed
-                    if response == True:
+                    if satisfied == True:
                         plt.close('all')
                         # retrieve objp_confirmed
                         objp_confirmed = np.array([[objp[count]] if 'objp_confirmed' not in globals() else objp_confirmed+[objp[count]]][0])
@@ -1262,7 +1423,6 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
                                 del globals()[var_to_delete]
                     # Not confirmed
                     else:
-                        root.destroy()
                         # Remove lastpoint from image
                         new_xydata = scat.get_offsets()[:-1]
                         scat.set_offsets(new_xydata)
@@ -1352,20 +1512,21 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
         ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
 
     # Write instructions
-    cv2.putText(img, 'Type "Y" to accept point detection.', (20, 20), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, 'Type "Y" to accept point detection.', (20, 20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
-    cv2.putText(img, 'If points are wrongfully (or not) detected:', (20, 43), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, 'If points are wrongfully (or not) detected:', (20, 43), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
-    cv2.putText(img, '- type "N" to dismiss this image,', (20, 66), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, '- type "N" to dismiss this image,', (20, 66), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
-    cv2.putText(img, '- type "C" to click points by hand (beware of their order).', (20, 89), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, '- type "C" to click points by hand (beware of their order).', (20, 89), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
-    cv2.putText(img, '   left click to add a point, right click to remove it, "H" to indicate it is not visible. ', (20, 112), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, '   left click to add a point, right click to remove it, "H" to indicate it is not visible. ', (20, 112), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
-    cv2.putText(img, '   Confirm with "Y", cancel with "N".', (20, 135), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, '   Confirm with "Y", cancel with "N".', (20, 135), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
-    cv2.putText(img, 'Use mouse wheel to zoom in and out and to pan', (20, 158), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
-    cv2.putText(img, 'Use mouse wheel to zoom in and out and to pan', (20, 158), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 2, lineType = cv2.LINE_AA)    
+    for dx, dy in outline_offsets:
+        cv2.putText(img, 'Type "Y" to accept point detection.', (20+dx, 20+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+        cv2.putText(img, 'If points are wrongfully (or not) detected:', (20+dx, 43+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+        cv2.putText(img, '- Type "N" to dismiss this image,', (20+dx, 66+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+        cv2.putText(img, '- Type "C" to click points by hand (beware of their order).', (20+dx, 89+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+        cv2.putText(img, '   Left click to add a point, Right click to remove it, "H" to indicate it is not visible. ', (20+dx, 112+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+        cv2.putText(img, '   Confirm with "Y", cancel with "N".', (20+dx, 135+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+        cv2.putText(img, 'Use mouse wheel to zoom in and out and to pan.', (20+dx, 158+dy), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, 'Type "Y" to accept point detection.', (20, 20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, 'If points are wrongfully (or not) detected:', (20, 43), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, '- Type "N" to dismiss this image,', (20, 66), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, '- Type "C" to click points by hand (beware of their order).', (20, 89), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, '   Left click to add a point, Right click to remove it, "H" to indicate it is not visible. ', (20, 112), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, '   Confirm with "Y", cancel with "N".', (20, 135), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
+    cv2.putText(img, 'Use mouse wheel to zoom in and out and to pan.', (20, 158), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,0,0), 7, lineType = cv2.LINE_AA)
     
     # Put image in a matplotlib figure for more controls
     plt.rcParams['toolbar'] = 'None'
@@ -1382,6 +1543,7 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
     plt.tight_layout()
     
     # Allow for zoom and pan in image
+    from mpl_interactions import zoom_factory, panhandler
     zoom_factory(ax)
     ph = panhandler(fig, button=2)
 
@@ -1406,7 +1568,7 @@ def imgp_objp_visualizer_clicker(img, imgp=[], objp=[], img_path=''):
         return
 
 
-def extract_frames(video_path, extract_every_N_sec=1, overwrite_extraction=False):
+def extract_frames(video_path, extract_every_N_sec=1, overwrite_extraction=False, output_dir=None):
     '''
     Extract frames from video 
     if has not been done yet or if overwrite==True
@@ -1415,22 +1577,27 @@ def extract_frames(video_path, extract_every_N_sec=1, overwrite_extraction=False
     - video_path: path to video whose frames need to be extracted
     - extract_every_N_sec: extract one frame every N seconds (can be <1)
     - overwrite_extraction: if True, overwrite even if frames have already been extracted
-    
+    - output_dir: directory where extracted frames will be saved (if None, same directory as the video)
+
     OUTPUT:
     - extracted frames in folder
     '''
     
-    if not Path(Path(video_path).exists().stem + '_00000.png') or overwrite_extraction:
+    video_path = Path(video_path)
+    output_dir = Path(output_dir) if output_dir is not None else video_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not list(output_dir.glob(f'{video_path.stem}_*.png')) or overwrite_extraction:
         cap = cv2.VideoCapture(str(video_path))
         if cap.isOpened():
             fps = round(cap.get(cv2.CAP_PROP_FPS))
             frame_nb = 0
-            logging.info(f'Extracting frames...')
+            logging.info(f'Extracting frames from {video_path} to {output_dir}...')
             while cap.isOpened():
                 ret, frame = cap.read()
                 if ret == True:
                     if frame_nb % (fps*extract_every_N_sec) == 0:
-                        img_path = (Path(video_path).stem + '_' +str(frame_nb).zfill(5)+'.png')
+                        img_path = output_dir / f'{video_path.stem}_{str(frame_nb).zfill(5)}.png'
                         cv2.imwrite(str(img_path), frame)
                     frame_nb+=1
                 else:
@@ -1517,7 +1684,7 @@ def recap_calibrate(ret, calib_path, calib_full_type):
     '''
     
     calib = rtoml.load(Path(calib_path))
-    
+
     ret_m, ret_px = [], []
     for c, cam in enumerate(calib.keys()):
         if cam != 'metadata':

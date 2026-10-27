@@ -60,18 +60,35 @@ ADMON_ICON = {"NOTE": "📝 Note", "TIP": "💡 Tip",
               "WARNING": "⚠️ Warning", "IMPORTANT": "❗ Important"}
 
 
+def add_heading_ids(md: str) -> str:
+    """Turn ### / #### headings into <hN id=...> with a clickable # anchor."""
+    def repl(m: re.Match) -> str:
+        hashes = m.group(1)
+        title  = m.group(2).strip()
+        slug   = slugify(title)
+        lvl    = len(hashes)
+        t      = clean_title(title)
+        return (f'<h{lvl} id="{slug}">{t}'
+                f'<a href="#{slug}" class="heading-anchor" aria-label="Link to section">#</a>'
+                f'</h{lvl}>')
+    return re.sub(r"^(#{3,4}) +(.+)$", repl, md, flags=re.MULTILINE)
+
+
 def _replace_admonition(m: re.Match) -> str:
-    atype   = m.group(1).upper()
-    raw     = m.group(2)
-    # Strip leading '> ' from each continuation line (handle both '> ' and '>')
-    body    = re.sub(r"^>[ \t]?", "", raw, flags=re.MULTILINE).strip()
-    css     = ADMON_CSS.get(atype, "info-box")
-    label   = ADMON_ICON.get(atype, atype.capitalize())
-    # Use markdown="1" so inner markdown is still processed by md_in_html
+    atype = m.group(1).upper()
+    raw   = m.group(2)
+    body  = re.sub(r"^>[ \t]?", "", raw, flags=re.MULTILINE).strip()
+    css   = ADMON_CSS.get(atype, "info-box")
+    label = ADMON_ICON.get(atype, atype.capitalize())
+
+    body = add_heading_ids(body)          # <-- new: give headings ids/anchors first
+    body_html = markdown.markdown(body, extensions=MD_EXTENSIONS, tab_length=2)
+
     return (
-        f'\n<div class="{css}" markdown="1">\n\n'
-        f'**{label}:**\n\n{body}\n\n'
-        f"</div>\n"
+        f'\n<div class="{css}">\n'
+        f'<h4>{label}:</h4>\n'
+        f'{body_html}\n'
+        f'</div>\n'
     )
 
 
@@ -255,25 +272,15 @@ def section_to_html(sec: dict) -> str:
     md = preprocess(md)
 
     # Add id anchors to h3/h4 sub-headings so sidebar sub-items can jump to them
-    def add_heading_id(m: re.Match) -> str:
-        hashes = m.group(1)
-        title  = m.group(2).strip()
-        slug   = slugify(title)
-        lvl    = len(hashes)
-        t      = clean_title(title)
-        return (f'<h{lvl} id="{slug}">{t}'
-                f'<a href="#{slug}" class="heading-anchor" aria-label="Link to section">#</a>'
-                f'</h{lvl}>')
-
-    md = re.sub(r"^(#{3,4}) +(.+)$", add_heading_id, md, flags=re.MULTILINE)
-
+    md = add_heading_ids(md)
+    
     # Convert to HTML
     body = markdown.markdown(md, extensions=MD_EXTENSIONS, output_format="html", tab_length=2)
 
     # Wrap <pre><code> in .code-block for dark styling
     body = re.sub(
-        r"<pre><code([^>]*)>(.*?)</code></pre>",
-        r'<div class="code-block"><pre><code\1>\2</code></pre></div>',
+        r'(?:<div class="highlight">)?(<pre(?:\s[^>]*)?>.*?</pre>)(?:</div>)?',
+        r'<div class="code-block">\1</div>',
         body, flags=re.DOTALL,
     )
 
@@ -305,7 +312,7 @@ HTML_TEMPLATE = """\
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pose2Sim Documentation</title>
     <link rel="icon" type="image/x-icon" href="Pose2Sim_favicon.ico"> 
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="{style_href}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -384,7 +391,7 @@ HTML_TEMPLATE = """\
         <!-- Footer -->
         <footer class="footer">
             <div class="footer-content">
-                <p><a href="https://github.com/perfanalytics/pose2sim" target="_blank">Pose2Sim GitHub</a> (⭐please leave a star!⭐) &bull;
+                <p><a href="https://github.com/perfanalytics/pose2sim" target="_blank">Pose2Sim GitHub</a> (⭐Star it⭐ or ❤️<a href="https://github.com/sponsors/davidpagnon" target="_blank">Sponsor it!</a>❤️) &bull;
                    <a href="#how-to-cite">Cite Pose2Sim</a>
                 </p>
                 <p>Open-source markerless motion capture &bull; BSD-3-Clause License</p>
@@ -393,7 +400,7 @@ HTML_TEMPLATE = """\
         </footer>
     </main>
 
-    <script src="script.js"></script>
+    <script src="{script_src}"></script>
     <script>document.addEventListener('DOMContentLoaded', () => hljs.highlightAll());</script>
 </body>
 </html>
@@ -429,7 +436,16 @@ def main() -> None:
         section_to_html(s) for s in sections if _is_step(s)
     )
 
-    html = HTML_TEMPLATE.format(toc=toc_html, sections=sections_html)
+    asset_version = int(max(
+        (SCRIPT_DIR / "script.js").stat().st_mtime,
+        (SCRIPT_DIR / "style.css").stat().st_mtime,
+    ))
+    html = HTML_TEMPLATE.format(
+        toc=toc_html,
+        sections=sections_html,
+        style_href=f"style.css?v={asset_version}",
+        script_src=f"script.js?v={asset_version}",
+    )
     OUTPUT_PATH.write_text(html, encoding="utf-8")
     print(f"Done. Written to {OUTPUT_PATH}")
 

@@ -31,25 +31,34 @@
 '''
 
 ## INIT
+import os
+import logging
 import numpy as np
 np.set_printoptions(legacy='1.21') # otherwise prints np.float64(3.0) rather than 3.0
 import pandas as pd
 import cv2
-import matplotlib.pyplot as plt
+import matplotlib as mpl
+try:
+    mpl.use('qtagg')
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.close(fig)
+except Exception as e:
+    logging.warning(f"GUI not available ({e}), falling back to 'Agg' backend.")
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 from matplotlib import patheffects
 from importlib.metadata import version
 from pathlib import Path
 from scipy import signal
 import json
-import os
 import fnmatch
 import re
 import shutil
 from anytree import RenderTree
 from anytree.importer import DictImporter
 from matplotlib.widgets import TextBox, Button
-import logging
 
 from Pose2Sim.common import sort_stringlist_by_last_number, bounding_boxes, interpolate_zeros_nans, \
                             is_video_file, is_image_file
@@ -71,6 +80,14 @@ __status__ = "Development"
 # Global matplotlib settings - remove toolbar
 plt.rcParams['toolbar'] = 'none'
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Matplotlib compatibility fix
+from matplotlib.backend_bases import ResizeEvent
+for _attr, _default in (('inaxes', None), ('x', None), ('y', None),
+                         ('xdata', None), ('ydata', None), ('dblclick', False),
+                         ('button', None), ('key', None)):
+    if not hasattr(ResizeEvent, _attr):
+        setattr(ResizeEvent, _attr, _default)
 
 # Define keypoint UI parameters
 TITLE_SIZE = 12
@@ -1337,7 +1354,7 @@ def time_lagged_cross_corr(camx, camy, lag_range, show=True, ref_cam_name='0', c
     if not np.isnan(pearson_r).all():
         max_corr = np.nanmax(pearson_r)
 
-        f, ax = plt.subplots(2,1, num='Synchronizing cameras')
+        f, ax = plt.subplots(2,1, num='Synchronizing cameras', clear=True)
         # speed
         camx.plot(ax=ax[0], label = f'Reference: {ref_cam_name}')
         camy.plot(ax=ax[0], label = f'Compared: {cam_name}')
@@ -1473,7 +1490,7 @@ def synchronize_cams_all(config_dict):
     nb_frames_per_cam = [len(fnmatch.filter(os.listdir(json_dir), '*.json')) for json_dir in json_dirs]
     cam_nb = len(json_dirs)
     cam_list = list(range(cam_nb))
-    cam_names = [Path(j_dir).name.split('_')[0] for j_dir in json_dirs]
+    cam_names = [re.sub(r'_json$', '', Path(j_dir).name) for j_dir in json_dirs]
     
     # frame range selection
     f_range = [[0, min([len(j) for j in json_files_names])] if frame_range in ('all', 'auto', []) else frame_range][0]

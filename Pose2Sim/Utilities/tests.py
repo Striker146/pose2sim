@@ -155,6 +155,7 @@ class TestWorkflow(unittest.TestCase):
         config_dict.get("pose").update({"save_video":'none'})
         config_dict.get('synchronization').update({'keypoints_to_consider':['RWrist']})
         config_dict.get('kinematics').update({'use_simple_model':True})
+        config_dict.get('kinematics').update({'make_bvh':False})
         Pose2Sim.runAll(config_dict)
         
 
@@ -168,6 +169,8 @@ class TestWorkflow(unittest.TestCase):
         # Body model with RTMO
         os.chdir(project_dir)
         config_dict.get("project").update({"project_dir":project_dir})
+        config_dict.get("pose").update({"device":'cpu'})
+        config_dict.get("pose").update({"backend":'onnxruntime'})
         config_dict.get("pose").update({"pose_model":'Body'})
         config_dict.get("pose").update({"mode":"""{'pose_class':'RTMO', 
                                                 'pose_model':'https://huggingface.co/datasets/DavidPagnon/rtmlib_models/resolve/main/mmpose/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-640x640-39e78cc4_20231211.onnx', 
@@ -181,6 +184,7 @@ class TestWorkflow(unittest.TestCase):
         config_dict.get("filtering").update({"display_figures":False})
         config_dict.get("filtering").update({"save_filt_plots":False})
         config_dict.get('kinematics').update({'use_simple_model':True})
+        config_dict.get('kinematics').update({'make_bvh':False})
         
         # 1. Run step by step
         Pose2Sim.calibration(config_dict)

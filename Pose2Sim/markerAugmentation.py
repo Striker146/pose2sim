@@ -31,7 +31,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 from Pose2Sim.common import convert_to_c3d, natural_sort_key, read_trc, write_trc,  \
-                            compute_height, add_shoulder_data, add_neck_hip_data
+                            compute_height, add_shoulder_data, add_neck_hip_data, add_smalltoe_data
 
 
 ## AUTHORSHIP INFORMATION
@@ -112,26 +112,32 @@ def augment_markers_all(config_dict):
         trc_files = trc_no_filtering
     sorted(trc_files, key=natural_sort_key)
 
+    # Add missing markers if needed
+    for trc_file in trc_files:
+        # Import TRC file
+        trc_data, frames_col, time_col, markers, header = read_trc(trc_file)
+        
+        # Create missing markers if needed
+        if not all(col in trc_data.columns for col in ['RShoulder', 'LShoulder', 'Neck', 'Hip','RSmallToe', 'LSmallToe']):
+            # add shoulder data if not in file
+            trc_data, markers, header = add_shoulder_data(trc_data, markers, header)
+            # add neck and midhip data if not in file
+            trc_data, markers, header = add_neck_hip_data(trc_data, markers, header)
+            # add small toe data if not in file
+            trc_data, markers, header = add_smalltoe_data(trc_data, markers, header)
+            # Overwrite TRC file
+            write_trc(trc_file, trc_data, frames_col, time_col, header)
+
     # Calculate subject heights
     if subject_height is None or subject_height == 0:
         subject_height = [default_height] * len(trc_files)
         logging.warning(f"No subject height found in Config.toml. Using default height of {default_height}m.")
     elif isinstance(subject_height, str) and subject_height.lower() == 'auto':
         subject_height = []
-        
         for trc_file in trc_files:
             # Import TRC file
             trc_data, frames_col, time_col, markers, header = read_trc(trc_file)
             
-            # Create missing markers if needed
-            if not all(col in trc_data.columns for col in ['RShoulder', 'LShoulder', 'Neck', 'Hip']):
-                # add shoulder data if not in file
-                trc_data, markers, header = add_shoulder_data(trc_data, markers, header)
-                # add neck and midhip data if not in file
-                trc_data, markers, header = add_neck_hip_data(trc_data, markers, header)
-                # Overwrite TRC file
-                write_trc(trc_file, trc_data, frames_col, time_col, header)
-
             try:
                 # frame range selection
                 f_range = [[frames_col.iloc[0], frames_col.iloc[-1]+1] if (frame_range in ('all', 'auto', []) or frames_col.iloc[0]>frame_range[0] or frames_col.iloc[1]<frame_range[1]) else frame_range][0]
@@ -170,6 +176,7 @@ def augment_markers_all(config_dict):
         logging.warning("Number of subject masses does not match number of TRC files. Missing masses are set to 70kg.")
         subject_mass += [70] * (len(trc_files) - len(subject_mass))
 
+    # Run marker augmentation
     for p in range(len(subject_mass)):
         trc_file = trc_files[p]
         trc_file_out = Path(trc_file).stem + f'_{augmenterModelName}.trc'
@@ -273,8 +280,7 @@ def augment_markers_all(config_dict):
             markers += response_markers
             
             header[2] = '\t'.join(part if i != 3 else str(len(markers)) for i, part in enumerate(header[2].split('\t')))
-            response_markers_str = '\t\t\t'.join(response_markers)
-            header[3] = header[3].replace('\t\t\t\n', f'\t\t\t{response_markers_str}\t\t\t\n')
+            header[3] = 'Frame#\tTime\t' + '\t\t\t'.join(markers) + '\t\t\n'
             header[4] = ['\t\t'+'\t'.join([f'X{i+1}\tY{i+1}\tZ{i+1}' for i in range(len(markers))]) + '\t\n'][0]
             
         # %% Extract minimum y-position across response markers. This is used

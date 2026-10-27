@@ -12,6 +12,17 @@ Functions shared between modules, and other utilities
 
 ## INIT
 import os
+import logging
+import matplotlib as mpl
+try:
+    mpl.use('qtagg')
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.close(fig)
+except Exception as e:
+    logging.warning(f"GUI not available ({e}), falling back to 'Agg' backend.")
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
 import rtoml
 import json
 import numpy as np
@@ -24,13 +35,10 @@ import cv2
 import c3d
 import sys
 import itertools as it
-import logging
 from anytree import PreOrderIter
 from importlib.metadata import version
 from pathlib import Path
 
-import customtkinter as ctk
-import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="c3d")
 
@@ -98,7 +106,7 @@ class plotWindow():
     '''
     Display several figures in tabs
     Taken from https://github.com/superjax/plotWindow/blob/master/plotWindow.py
-
+ 
     USAGE:
     pw = plotWindow()
     f = plt.figure()
@@ -108,21 +116,17 @@ class plotWindow():
     plt.plot(x2, y2)
     pw.addPlot("2", f)
     '''
-
+ 
     def __init__(self, parent=None):
-        # Lazy imports: PySide6 requires a display server and crashes on headless
-        # environments (e.g. CI runners) if imported at module level. Since
-        # common.py is imported by nearly every module, we defer Qt imports to
-        # here so only code that actually creates a plotWindow needs a display.
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
         from PySide6.QtWidgets import QMainWindow, QApplication, QWidget, QTabWidget, QVBoxLayout
-
+ 
         self.FigureCanvas = FigureCanvas
         self.NavigationToolbar = NavigationToolbar
         self.QWidget = QWidget
         self.QVBoxLayout = QVBoxLayout
-
+ 
         self.app = QApplication.instance()
         if not self.app:
             self.app = QApplication(sys.argv)
@@ -137,27 +141,34 @@ class plotWindow():
         self.MainWindow.setCentralWidget(self.tabs)
         self.MainWindow.resize(1280, 720)
         self.MainWindow.show()
-
+ 
     def addPlot(self, title, figure):
         new_tab = self.QWidget()
         layout = self.QVBoxLayout()
         new_tab.setLayout(layout)
-
+ 
         figure.subplots_adjust(left=0.1, right=0.99, bottom=0.1, top=0.91, wspace=0.2, hspace=0.2)
         new_canvas = self.FigureCanvas(figure)
         new_toolbar = self.NavigationToolbar(new_canvas, new_tab)
-
+ 
         layout.addWidget(new_canvas)
         layout.addWidget(new_toolbar)
         self.tabs.addTab(new_tab, title)
-
+ 
         self.toolbar_handles.append(new_toolbar)
         self.canvases.append(new_canvas)
         self.figure_handles.append(figure)
         self.tab_handles.append(new_tab)
-
+ 
     def show(self):
         self.app.exec()
+        self.close()
+ 
+    def close(self):
+        for figure in self.figure_handles:
+            plt.close(figure)
+        self.MainWindow.close()
+        self.MainWindow.deleteLater()
 
 
 ## FUNCTIONS
@@ -196,7 +207,7 @@ def get_max_workers(device='cpu'):
     Determine the number of parallel workers for pose estimation.
     
     INPUTS:
-        device: 'cpu', 'cuda', 'mps', 'rocm'
+        device: 'cpu', 'cuda', 'mps', 'rocm', 'gpu', 'npu'
     
     OUTPUTS:
         max_workers: Number of workers (>= 1)
@@ -224,6 +235,7 @@ def get_max_workers(device='cpu'):
 def read_mot(mot_path):
     '''
     Read a .mot file (OpenSim motion file).
+    Also reads .sto files.
     
     INPUT:
     - mot_path: path to the .mot file
@@ -239,13 +251,13 @@ def read_mot(mot_path):
     with open(mot_path, 'r') as f:
         lines = f.readlines()
     
-    # Find the end of the header (line with "endheader")
+    # Find the end of the header (line after "endheader")
     for i, line in enumerate(lines):
         if line.strip().lower() == 'endheader':
             header_end_line = i
             break
         
-    header_lines = lines[:header_end_line + 1]
+    header_lines = lines[:header_end_line + 2]
     
     # Read the data portion
     data = pd.read_csv(mot_path, sep='\t', skiprows=header_end_line + 1)
@@ -378,7 +390,7 @@ def add_shoulder_data(trc_data, markers, header):
 
         # Update header
         header[2] = '\t'.join(part if i != 3 else str(len(markers)) for i, part in enumerate(header[2].split('\t')))
-        header[3] = header[3].replace('\t\t\t\n', f'\t\t\t{"RShoulder"}\t\t\t{"LShoulder"}\t\t\t\n')
+        header[3] = header[3].rstrip('\n') + '\tRShoulder\t\t\tLShoulder\t\t\n'
         header[4] = ['\t\t'+'\t'.join([f'X{i+1}\tY{i+1}\tZ{i+1}' for i in range(len(markers))]) + '\t\n'][0]
 
         # update trc_data
@@ -405,22 +417,79 @@ def add_neck_hip_data(trc_data, markers, header):
         'Hip': ['RHip', 'LHip']}
 
     for mk_name, r_l_markers in midpoints.items():
-        if mk_name not in markers:
-            try:
-                # Add marker name
-                markers.append(mk_name)
+        if mk_name in markers:
+            continue
+        
+        try:
+            r_l_data = [trc_data[m] for m in r_l_markers]
+        except KeyError as e:
+            logging.warning(f"Cannot add {mk_name}: missing {e}")
+            continue
 
-                # Update header
-                header[2] = '\t'.join(part if i != 3 else str(len(markers)) for i, part in enumerate(header[2].split('\t')))
-                header[3] = header[3].replace('\t\t\t\n', f'\t\t\t{mk_name}\t\t\t\n')
-                header[4] = ['\t\t'+'\t'.join([f'X{i+1}\tY{i+1}\tZ{i+1}' for i in range(len(markers))]) + '\t\n'][0]
+        # Add marker name
+        markers.append(mk_name)
+        
+        # Update header
+        header[2] = '\t'.join(part if i != 3 else str(len(markers)) for i, part in enumerate(header[2].split('\t')))
+        header[3] = header[3].rstrip('\n') + f'\t{mk_name}\t\t\n'
+        header[4] = '\t\t' + '\t'.join(f'X{i+1}\tY{i+1}\tZ{i+1}' for i in range(len(markers))) + '\t\n'
 
-                # update trc_data
-                r_l_data = [trc_data[marker] for marker in r_l_markers]
-                mid_data = pd.DataFrame(sum([data.values for data in r_l_data])/2, columns=[mk_name]*3)
-                trc_data = pd.concat([trc_data, mid_data], axis=1)
-            except Exception as e:
-                logging.warning(f"Failed to add {mk_name} marker. Error: {e}")
+        # Update trc_data
+        mid_values = np.mean(np.stack([d.values for d in r_l_data], axis=0), axis=0)
+        mid_data = pd.DataFrame(mid_values, columns=[mk_name] * 3)
+        trc_data = pd.concat([trc_data, mid_data], axis=1)
+
+    return trc_data, markers, header
+
+
+def add_smalltoe_data(trc_data, markers, header):
+    '''
+    Add small toe data to trc_data if not present.
+    Defined as the BigToe point + 0.5*length(BigToe to Heel) in the Hip to Hip direction - 0.2*length(BigToe to Heel) in the BigToe to Heel direction.
+    Also update header and markers.
+    '''
+
+    if all(col in trc_data.columns for col in ['RBigToe', 'LBigToe', 'RHeel', 'LHeel', 'RHip', 'LHip']):
+        if 'RSmallToe' not in markers and 'LSmallToe' not in markers:
+            markers.append('RSmallToe')
+            markers.append('LSmallToe')
+
+            # Update header
+            header[2] = '\t'.join(part if i != 3 else str(len(markers)) for i, part in enumerate(header[2].split('\t')))
+            header[3] = header[3].rstrip('\n') + '\tRSmallToe\t\t\tLSmallToe\t\t\n'
+            header[4] = ['\t\t'+'\t'.join([f'X{i+1}\tY{i+1}\tZ{i+1}' for i in range(len(markers))]) + '\t\n'][0]
+
+            # update trc_data
+            rbigtoe_data, lbigtoe_data = trc_data['RBigToe'], trc_data['LBigToe']
+            rheel_data, lheel_data = trc_data['RHeel'], trc_data['LHeel']
+            rhip_data, lhip_data = trc_data['RHip'], trc_data['LHip']
+
+            rbigtoe_to_heel_direction = rbigtoe_data.values - rheel_data.values
+            rbigtoe_to_heel_direction = rbigtoe_to_heel_direction / np.linalg.norm(rbigtoe_to_heel_direction, axis=1)[:, None]
+            lbigtoe_to_heel_direction = lbigtoe_data.values - lheel_data.values
+            lbigtoe_to_heel_direction = lbigtoe_to_heel_direction / np.linalg.norm(lbigtoe_to_heel_direction, axis=1)[:, None]
+            rbigtoe_to_heel_length = np.linalg.norm(rbigtoe_data.values - rheel_data.values, axis=1)[:, None]
+            lbigtoe_to_heel_length = np.linalg.norm(lbigtoe_data.values - lheel_data.values, axis=1)[:, None]
+
+            rlhip_direction = rhip_data.values - lhip_data.values
+            rlhip_direction = rlhip_direction / np.linalg.norm(rlhip_direction, axis=1)[:, None]
+
+            rsmalltoe_data = pd.DataFrame(
+                rbigtoe_data.values
+                + 0.5 * rbigtoe_to_heel_length * rlhip_direction
+                - 0.2 * rbigtoe_to_heel_length * rbigtoe_to_heel_direction,
+                columns=['RSmallToe'] * 3
+            )
+            lsmalltoe_data = pd.DataFrame(
+                lbigtoe_data.values
+                - 0.5 * lbigtoe_to_heel_length * rlhip_direction
+                - 0.2 * lbigtoe_to_heel_length * lbigtoe_to_heel_direction,
+                columns=['LSmallToe'] * 3
+            )
+            trc_data = pd.concat([trc_data, rsmalltoe_data, lsmalltoe_data], axis=1)
+        
+    else:
+        logging.warning("Cannot add SmallToe data: some of the following markers are missing: RBigToe, LBigToe, RHeel, LHeel, RHip, LHip.")
 
     return trc_data, markers, header
 
@@ -926,6 +995,9 @@ def create_c3d_file(c3d_path, marker_names, trc_data_np):
     times = trc_data_np[:,0]
     frame_rate = round((len(times)-1) / (times[-1] - times[0]))
 
+    # Axes permutation to convert from OpenSim (Y-up) to Visual3D (Z-up) # XYZ -> ZXY
+    trc_data_np = trc_data_np[:, [0] + [i for j in range(1, len(marker_names)*3, 3) for i in [j+2, j, j+1]]]
+
     # write c3d file
     writer = c3d.Writer(point_rate=frame_rate, analog_rate=0, point_scale=1.0, point_units='mm', gen_scale=-1.0)
     writer.set_point_labels(marker_names)
@@ -1160,7 +1232,7 @@ def best_coords_for_measurements(Q_coords, large_hip_knee_angles=90):
             Q_coords_low_angles = Q_coords.iloc[pd.Series(ang_mean).nsmallest(50).index]
     except:
         Q_coords_low_angles = Q_coords
-        logging.warning(f"At least one among the RAnkle, RKnee, RHip, RShoulder, LAnkle, LKnee, LHip, LShoulder markers is missing for computing the knee and hip angles. Not restricting these angles to be below {large_hip_knee_angles}° as a fallback.")
+        logging.warning(f"At least one among the Hip, RAnkle, RKnee, RHip, RShoulder, LAnkle, LKnee, LHip, LShoulder markers is missing for computing the knee and hip angles. Not restricting these angles to be below {large_hip_knee_angles}° as a fallback.")
 
     if Q_coords_low_angles.empty:
         logging.warning('The selected person might not move, or is crouching for the whole sequence, or is not well detected. Taking all available data instead of filtering them as a fallback.')
@@ -1282,36 +1354,67 @@ def compute_leg_length(trc_path, large_hip_knee_angles=90, trimmed_extrema_perce
     return leg_length
 
 
-def sort_people_sports2d(keyptpre, keypt, scores=None, max_dist=None, max_unseen_frames=None, frames_since_last_seen=None):
+def sort_people_sports2d(keyptpre, keypt, scores=None, match_by='bbox', pred_displacement=None, max_dist=None, max_unseen_frames=None, frames_since_last_seen=None):
     '''
-    Associate persons across frames (Sports2D method)
-    Persons' indices are sometimes swapped when changing frame
-    A person is associated to another in the next frame when they are at a small distance
-    
-    N.B.: Uses Hungarian algorithm (scipy.optimize.linear_sum_assignment): does not require min_with_single_indices anymore
-          Broadcasts distances: does not require euclidean_distance anymore
-          Still requires pad_shape
+    Associate persons across frames, avoiding ID swaps
+    A person's ID is matched to a detection in the next frame when they are close to each other
+    Both the 2D and 3D cases are supported
+    N.B.: Requires the pad_shape function
+
+    Algorithm:
+    - By default, sort people based on minimal frame-by-frame keypoint displacement
+    - Instead of keypoints, optionally works on bounding boxes or centroids
+    - Instead of minimal displacement, optionally predicts positions and minimizes their distances to detections
+    - Tracks people through temporary disappearances
+    - Sets a maximum number of frames beyond which a non-detected person is forgotten
+    - Sets a maximum distance beyond which persons cannot be associated with each other
+
+    Recommendations:
+    - Predict displacement: 
+               Initialize with np.zeros((n_persons, 2)) in 2D, np.zeros((n_persons, 3)) in 3D, or to None​ for not using it.
+               Use when people move in sustained straight lines (eg sprinting, cycling, swimming) or in case of long occlusions or slow framerate. 
+               Don't use if there are sudden changes of direction (eg basketball, hopping). 
+               Experiment if you are unsure (eg football, ...). 
+               
+    - Match by Keypoints vs Centroid vs Bbox: 
+      - In 2D: Usually favor keypoints, especially if people are passing closely in front of each other with distinct limb positions and limited frame-by-frame limb motion (eg yoga class, ballroom dance, and even wrestling and gymnastics if the framerate is high).
+               Favor centroid in crowded scenes where people are very small in the image (eg < 40 pixels). 
+               Favor bbox with `predict_displacement=true` with people of different sizes moving in a straight line with fast limb motion and large occlusions (eg sprinting with occlusions).
+      - In 3D: Favor keypoints if depth is reliable (eg multiview triangulation), with relatively little frame-by-frame limb motion, and if people are "hugging" each other.
+               Favor centroid if depth is unreliable (eg monocular 3D).
+               Bboxes are not reliable.
 
     INPUTS:
-    - keyptpre: (K, L, M) array of 2D or 3D coordinates for K persons in the previous frame, L keypoints, M 2D/3D coordinates
+    - keyptpre: (K, L, M) array of coordinates for K persons in the previous frame, L keypoints, M 2D/3D coordinates
     - keypt: idem keyptpre, for current frame
     - score: (K, L) array of confidence scores for K persons, L keypoints (optional) 
-    - max_dist: maximum distance threshold for association. If None, no threshold applied.
+    - match_by: 'centroid' (default): Euclidean distance between keypoint centroids
+                'keypoints': Mean over per-keypoint distances
+    - pred_displacements: (K, M) array of M-dimensional displacement for K persons.
+                  Initialize with np.zeros((n_persons, 2)) in 2D, np.zeros((n_persons, 3)) in 3D, or None to disable (default).
+                  Estimated as prev_centroid_loc - prev_prev_centroid_loc (linear translation), kept if the person has momentarily disappeared.
+    - max_dist: Max distance a person can jump from their previous position before being considered as a new one.
+                In pixels (eg 50 pixels) or meters (eg 1 meter). Increase if predict_displacement=False. 
+                If match_by='bbox', should be interpreted as `1-IoU` (eg 0.7 for a minimum of 30% overlap).
+                If None (default), no threshold applied.
                 If distance > max_dist, person is treated as new (no association)
-    - max_unseen_frames: int or None. If a person has not been seen for more than this many frames, they will be considered stale
-                        and their ID won't be confused with any other person passing by.
-                        If None, staleness tracking is disabled (original behavior).
+    - max_unseen_frames: int or None. Max number of seconds that a person can be unseen before the next person passing by is given a new ID.
+                        If None (default), staleness tracking is disabled.
     - frames_since_last_seen: array of shape (K,) tracking how many frames since each previous person
                               was last seen. Required when max_unseen_frames is not None. Updated and returned.
     
     OUTPUTS:
-    - sorted_prev_keypoints: array with reordered persons with values of previous frame if current is empty
-    - sorted_keypoints: array with reordered persons
-    - sorted_scores: array with reordered scores (if scores provided, else sorted_ids)
-    - frames_since_last_seen: updated staleness counter array (only returned when max_unseen_frames is not None)
+    - tracked_keypoints: (N, L, M) array with N reordered persons with values of previous frame in empty slots (for tracking)
+                         Use this as keyptpre in the next frame.
+    - sorted_keypoints: (N, L, M) array with N reordered persons with nans in empty slots (actually detected persons)
+    - sorted_scores: If scores in inputs: (N, L) array with reordered scores with nans in empty slots
+                     Otherwise, (N,) array mapping output index to original curr index (-1 if unmatched)
+    - frames_since_last_seen: (N,) updated staleness counter array (only returned when max_unseen_frames is not None)
+    - pred_displacements: (N, M) updated velocity array. Only returned when velocities is not None.
     '''
 
     use_staleness = max_unseen_frames is not None
+    use_prediction = pred_displacement is not None
 
     # Handle empty frames
     n_prev = len(keyptpre)
@@ -1321,35 +1424,76 @@ def sort_people_sports2d(keyptpre, keypt, scores=None, max_dist=None, max_unseen
             ret = (np.array([]), np.array([]), np.array([]))
         else:
             ret = (np.array([]), np.array([]), np.array([], dtype=int))
-        return ret + (np.array([], dtype=int),) if use_staleness else ret
+        if use_staleness: ret += (np.array([], dtype=int),)
+        if use_prediction: ret += (pred_displacement,)
+        return ret
     if n_prev == 0:
         new_fsls = np.zeros(n_curr, dtype=int)
         if scores is not None:
-            ret = (np.array([]), keypt, scores)
+            ret = (keypt.copy(), keypt, scores)
         else:
-            ret = (np.array([]), keypt, np.arange(n_curr))
-        return ret + (new_fsls,) if use_staleness else ret
+            ret = (keypt.copy(), keypt, np.arange(n_curr))
+        if use_staleness: ret += (new_fsls,)
+        if use_prediction: ret += (np.zeros((n_curr, keypt.shape[2])),)
+        return ret
     
     # Initialize frames_since_last_seen if staleness tracking is enabled but not yet started
     if use_staleness and frames_since_last_seen is None:
         frames_since_last_seen = np.zeros(n_prev, dtype=int)
 
+    # Predict positions of previous frame keypoints if prediction is enabled
+    keyptpre_orig = keyptpre.copy()
+    if use_prediction:
+        keyptpre = keyptpre + pred_displacement[:, np.newaxis, :]
+
     # Broadcasts the computation of distance matrix for all possible associations instead of using euclidean_distance in a loop
-    keyptpre_expanded = keyptpre[:, np.newaxis, :, :]
-    keypt_expanded = keypt[np.newaxis, :, :, :]
-    diff = keypt_expanded - keyptpre_expanded
-    distances_per_keypoint = np.sqrt(np.nansum(diff**2, axis=3))
-    dist_matrix = np.nanmean(distances_per_keypoint, axis=2)
-    dist_matrix = np.nan_to_num(dist_matrix, nan=1e10, posinf=1e10) # Replace inf/nan with large number
+    if match_by == 'bbox':
+        bboxes_pre = np.stack([
+            np.nanmin(keyptpre[..., 0], axis=1),
+            np.nanmin(keyptpre[..., 1], axis=1),
+            np.nanmax(keyptpre[..., 0], axis=1),
+            np.nanmax(keyptpre[..., 1], axis=1)
+        ], axis=1)
+        bboxes = np.stack([
+            np.nanmin(keypt[..., 0], axis=1),
+            np.nanmin(keypt[..., 1], axis=1),
+            np.nanmax(keypt[..., 0], axis=1),
+            np.nanmax(keypt[..., 1], axis=1)
+        ], axis=1)
+        # IoU matrix
+        inter_x1 = np.maximum(bboxes_pre[:, None, 0], bboxes[None, :, 0])
+        inter_y1 = np.maximum(bboxes_pre[:, None, 1], bboxes[None, :, 1])
+        inter_x2 = np.minimum(bboxes_pre[:, None, 2], bboxes[None, :, 2])
+        inter_y2 = np.minimum(bboxes_pre[:, None, 3], bboxes[None, :, 3])
+        inter_area = np.maximum(0, inter_x2 - inter_x1) * np.maximum(0, inter_y2 - inter_y1)
+        area_pre  = (bboxes_pre[:, 2] - bboxes_pre[:, 0]) * (bboxes_pre[:, 3] - bboxes_pre[:, 1])
+        area = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+        union_area = area_pre[:, None] + area[None, :] - inter_area
+        iou_matrix = np.where(union_area > 0, inter_area / union_area, 0.0)
+        dist_matrix = 1.0 - iou_matrix  # cost = 1 − IoU
     
+    elif match_by == 'centroid':
+        centpre = np.nanmean(keyptpre, axis=1)
+        cent = np.nanmean(keypt, axis=1)
+        diff = cent[np.newaxis, :, :] - centpre[:, np.newaxis, :]
+        dist_matrix = np.sqrt(np.nansum(diff**2, axis=2))
+    
+    else:  # 'keypoints'
+        diff = keypt[None, :, :, :] - keyptpre[:, None, :, :]
+        distances_per_keypoint = np.sqrt(np.nansum(diff**2, axis=3))
+        dist_matrix = np.nanmean(distances_per_keypoint, axis=2)
+
     # Inflate distances for stale persons so they won't attract new detections
     if use_staleness:
         stale_mask = frames_since_last_seen >= max_unseen_frames
         dist_matrix[stale_mask, :] = 1e10
 
     # Hungarian algorithm instead of min_with_single_indices in previous versions (faster when many people)
-    # Finds the associations with smallest distances between previous and current frame, each person associated only once
-    pre_ids, curr_ids = linear_sum_assignment(dist_matrix)
+    # Finds the associations with smallest distances between previous and current frame, each person associated only once, with max distance threshold
+    assignment_matrix = dist_matrix
+    if max_dist is not None:
+        assignment_matrix = np.where(dist_matrix > max_dist, 1e10, dist_matrix)
+    pre_ids, curr_ids = linear_sum_assignment(assignment_matrix)
     
     # Filter associations based on max_dist threshold
     valid_associations = []
@@ -1388,11 +1532,9 @@ def sort_people_sports2d(keyptpre, keypt, scores=None, max_dist=None, max_unseen
         else:
             sorted_ids[n_prev + new_idx] = curr_idx
 
-    # Pad keyptpre to match new size
-    keyptpre_padded = pad_shape(keyptpre, n_total, fill_value=np.nan)
-    
     # Keep track of previous values when missing
-    sorted_prev_keypoints = np.where(
+    keyptpre_padded = pad_shape(keyptpre_orig, n_total, fill_value=np.nan)  # Pad keyptpre to match new size
+    tracked_keypoints = np.where(
         np.isnan(sorted_keypoints) & ~np.isnan(keyptpre_padded), 
         keyptpre_padded, 
         sorted_keypoints)
@@ -1400,21 +1542,34 @@ def sort_people_sports2d(keyptpre, keypt, scores=None, max_dist=None, max_unseen
     # Update frames_since_last_seen
     if use_staleness:
         updated_fsls = np.full(n_total, 0, dtype=int)
-        updated_fsls[:n_prev] = frames_since_last_seen + 1  # increment for all existing
+        updated_fsls[:n_prev] = frames_since_last_seen + 1
         for prev_idx, _ in valid_associations:
             updated_fsls[prev_idx] = 0  # reset for matched (including recycled stale slots)
-        # New persons (beyond n_prev) already initialized at 0
     
+    # Update predictions
+    if use_prediction:
+        updated_predictions = np.zeros((n_total, keyptpre_orig.shape[2]))
+        updated_predictions[:n_prev] = pred_displacement # carry forward for unmatched tracks
+        if valid_associations:
+            pre_va, curr_va = zip(*valid_associations)
+            pre_va, curr_va = list(pre_va), list(curr_va)
+            updated_predictions[pre_va] = (np.nanmean(keypt[curr_va], axis=1) -
+                                        np.nanmean(keyptpre_orig[pre_va], axis=1))
+
+    # Returns
     if use_staleness:
         if scores is not None:
-            return sorted_prev_keypoints, sorted_keypoints, sorted_scores, updated_fsls
+            ret = (tracked_keypoints, sorted_keypoints, sorted_scores, updated_fsls)
         else:
-            return sorted_prev_keypoints, sorted_keypoints, sorted_ids, updated_fsls
+            ret = (tracked_keypoints, sorted_keypoints, sorted_ids, updated_fsls)
     else:
         if scores is not None:
-            return sorted_prev_keypoints, sorted_keypoints, sorted_scores
+            ret = (tracked_keypoints, sorted_keypoints, sorted_scores)
         else:
-            return sorted_prev_keypoints, sorted_keypoints, sorted_ids
+            ret = (tracked_keypoints, sorted_keypoints, sorted_ids)
+    if use_prediction:
+        ret += (updated_predictions,)
+    return ret
 
 
 def sort_people_rtmlib(pose_tracker, keypoints, scores):
@@ -1680,25 +1835,6 @@ def draw_keypts(img, X, Y, scores, cmap_str='RdYlGn'):
     return img
 
 
-def get_screen_size():
-    '''
-    Get the screen dimensions
-
-    INPUTS:
-    - None
-
-    OUTPUTS:
-    - tuple of int: (screen_width, screen_height)
-    '''
-
-    root = ctk.CTk()
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    root.destroy()
-    
-    return screen_width, screen_height
-
-
 def calculate_display_size(W, H, screen_width, screen_height, margin=100):
     '''
     Calculate the optimal display size for the image
@@ -1726,6 +1862,39 @@ def calculate_display_size(W, H, screen_width, screen_height, margin=100):
     new_height = int(H * scale_factor)
     
     return new_width, new_height
+
+
+def _import_qt():
+    try:
+        from PySide6.QtWidgets import QMessageBox, QApplication
+        from PySide6.QtCore import Qt
+        return QMessageBox, QApplication, Qt
+    except Exception as e:
+        raise RuntimeError(
+            "Qt GUI dependencies are unavailable in this environment. "
+            "Install system OpenGL/EGL libraries or run in a desktop environment."
+        ) from e
+
+
+def get_screen_size():
+    '''
+    Get the screen dimensions
+
+    INPUTS:
+    - None
+
+    OUTPUTS:
+    - tuple of int: (screen_width, screen_height)
+    '''
+
+    _, QApplication, _ = _import_qt()
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    screen = app.primaryScreen()
+    screen_width, screen_height = screen.size().width(), screen.size().height()
+    
+    return screen_width, screen_height
 
 
 def set_always_on_top(fig):
@@ -1757,3 +1926,29 @@ def set_always_on_top(fig):
             window.show()
         except (ImportError, AttributeError):
             pass
+
+
+def show_qt_message_box(title, message, question=False, parent=None):
+
+    QMessageBox, QApplication, Qt = _import_qt()
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    
+    msg_box = QMessageBox(parent)
+    msg_box.setWindowTitle(title)
+    msg_box.setText(message)
+    msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+    msg_box.setIcon(QMessageBox.Icon.NoIcon)
+    if question:
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        result = msg_box.exec()
+        return result == QMessageBox.StandardButton.Yes
+    else:
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
+        return True
+
+
