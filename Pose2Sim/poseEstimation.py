@@ -44,6 +44,8 @@ from pathlib import Path
 import numpy as np
 import cv2
 import threading
+import rtoml
+from scipy.spatial.transform import Rotation as R
 
 from rtmlib import PoseTracker, BodyWithFeet, Wholebody, Body, Hand, Custom, Animal, draw_skeleton
 from rtmlib.tools.object_detection.post_processings import nms
@@ -346,7 +348,7 @@ def save_to_openpose(json_file_path, keypoints, scores):
         json.dump(json_output, json_file)
 
 
-def process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker, cancel_event=None):
+def process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker, cancel_event=None, roll=0):
     '''
     Estimate pose from a video file
     
@@ -406,7 +408,16 @@ def process_video(video_path, pose_tracker, skeleton_model, frame_range, average
     # Retrieve keypoint names from model
     keypoints_ids = [node.id for _, _, node in RenderTree(skeleton_model) if node.id!=None]
     kpt_id_max = max(keypoints_ids)+1
-
+    #print(roll)
+    roll = roll % 360
+    image_action = None
+    if 45 < roll and roll < 135:
+        image_action = cv2.ROTATE_90_COUNTERCLOCKWISE
+    if 135 < roll and roll < 225:
+        image_action = cv2.ROTATE_180
+    if 225 < roll and roll < 315:
+        image_action = cv2.ROTATE_90_CLOCKWISE
+    index_mapping = ['90 CLOCKWISE', '180', "90 COUNTERCLOCKWISE"]
     with tqdm(iterable=range(*f_range), desc=f'Processing {Path(video_path).name}') as pbar:
         while cap.isOpened():
             if frame_idx in range(*f_range):
@@ -419,7 +430,36 @@ def process_video(video_path, pose_tracker, skeleton_model, frame_range, average
             
                 try: # Frames with no detection cause errors on MacOS CoreMLExecutionProvider
                     # Detect poses
+                    if not (image_action is None):
+                        action_str = index_mapping[image_action]
+
+                        frame = cv2.rotate(frame,image_action)
+                    else:
+                        action_str = "None"
+
+                    height, width = frame.shape[:2]
+                    center = (width // 2, height // 2)
+                    scale = 1
+                    #rotation_matrix = cv2.getRotationMatrix2D(center, roll, scale)
+                    
+                    #rotated_image = cv2.warpAffine(frame, rotation_matrix, (width, height))
+                    #print(f'roll : {roll}\n ACTION : {action_str}')
                     keypoints, scores = pose_tracker(frame)
+
+                    kp = np.asarray(keypoints, dtype=float)
+                    x, y = kp[..., 0].copy(), kp[..., 1].copy()
+
+                    if image_action == cv2.ROTATE_180:
+                        kp[..., 0], kp[..., 1] = W - 1 - x, H - 1 - y
+                    elif image_action == cv2.ROTATE_90_CLOCKWISE:
+                        kp[..., 0], kp[..., 1] = y, H - 1 - x
+                    elif image_action == cv2.ROTATE_90_COUNTERCLOCKWISE:
+                        kp[..., 0], kp[..., 1] = W - 1 - y, x
+
+                    #inv = cv2.invertAffineTransform(rotation_matrix)
+                    #pts = keypoints.reshape(-1, 1, 2).astype(np.float32)
+                    #keypoints = cv2.transform(pts, inv).reshape(keypoints.shape)
+                    #print(keypoints)
 
                     # Non maximum suppression (at pose level, not detection, and only using likely keypoints)
                     frame_shape = frame.shape
@@ -729,6 +769,23 @@ def estimate_pose_all(config_dict):
     pose_model_name = pose_model
     skeleton_model, ModelClass, mode = setup_model_class_mode(pose_model, mode, config_dict)
 
+
+    #Ryans Custom Changes
+    calib_dir = [Path(session_dir) / c for c in os.listdir(session_dir) if (Path(session_dir) / c).is_dir() and 'calib' in c.lower()][0]
+
+    try:
+        calib_dir = [c for c in Path(session_dir).iterdir() if c.is_dir() and 'calib' in c.name.lower()][0]
+    except:
+        raise Exception(f'No .toml calibration directory found.')
+
+    try:
+        calib_files = list(Path(calib_dir).glob('*.toml'))
+        calib_file = max(calib_files, key=lambda p: p.stat().st_ctime)  # lastly created calibration file
+    except:
+        raise Exception(f'No .toml calibration file found in the {calib_dir}.')
+    calib = rtoml.load(calib_file)
+    #Back to OG Pose2Sim
+    
     # Estimate pose
     try:
         pose_listdirs_names = next(os.walk(pose_dir))[1]
@@ -831,7 +888,14 @@ def estimate_pose_all(config_dict):
                     pose_tracker.reset()
                     if tracking_mode == 'deepsort':
                         deepsort_tracker.tracker.delete_all_tracks()
-                    process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker)
+                    cam_id = video_path.suffixes[0][1:]
+                    cam = calib[str(cam_id)]
+                    rvec = np.array(cam['rotation'])  
+                    R, _ = cv2.Rodrigues(rvec)
+                    up = R @ np.array([0, 0, 1])          # world up in camera coords (assumes Z-up world)
+                    roll = np.degrees(np.arctan2(up[0], -up[1]))
+                    print(roll)
+                    process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker, roll=roll)
 
         else:
             # Process image folders
