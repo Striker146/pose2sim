@@ -59,6 +59,7 @@ from pathlib import Path
 import warnings
 from contextlib import contextmanager,redirect_stderr,redirect_stdout
 from os import devnull
+from Pose2Sim.Pose2Sim import determine_level
 
 outline_offsets = [(-2,-2),(-2,2),(2,-2),(2,2),(-2,0),(2,0),(0,-2),(0,2)]
 
@@ -273,7 +274,17 @@ def read_vicon(vicon_path):
     ret, C, S, D, K, R, T = [], [], [], [], [], [], []
     vid_id, vid_ids = 0, []
 
-    video_path = Path(vicon_path).parents[1] / 'videos'
+    base_path = Path(vicon_path).parents[1]
+    p = list(Path(base_path).glob('*'))
+    batch_paths = [x for x in p if not x.is_file() and x.stem != "calibration"]
+    sel_path = batch_paths[0]
+    batch_video_path = Path(sel_path, "videos")
+
+    if batch_video_path.exists():
+        video_path = batch_video_path
+    else:
+        video_path = sel_path
+        
     if not video_path.exists():
         logging.error(f'No video folder found at {video_path}. Required for Vicon calibration.')
         raise FileNotFoundError(f'No video folder found at {video_path}. Required for Vicon calibration.')
