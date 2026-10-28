@@ -374,7 +374,7 @@ def save_to_openpose(json_file_path, keypoints, scores):
         json.dump(json_output, json_file)
 
 
-def process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker, cancel_event=None, roll=0):
+def process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, sports2d_tracking_params, deepsort_tracker, cancel_event=None,calib=None):
     '''
     Estimate pose from a video file
     
@@ -434,7 +434,12 @@ def process_video(video_path, pose_tracker, skeleton_model, frame_range, average
     # Retrieve keypoint names from model
     keypoints_ids = [node.id for _, _, node in RenderTree(skeleton_model) if node.id!=None]
     kpt_id_max = max(keypoints_ids)+1
+    use_prediction, match_by, max_distance_px, max_unseen_frames = sports2d_tracking_params
+    frames_since_last_seen = None
     #print(roll)
+    roll = 0
+    if calib:
+        roll = get_roll(video_path,calib)
     roll = roll % 360
     image_action = None
     if 45 < roll and roll < 135:
@@ -454,80 +459,80 @@ def process_video(video_path, pose_tracker, skeleton_model, frame_range, average
                 if cancel_event and cancel_event.is_set():
                     break
             
-                try: # Frames with no detection cause errors on MacOS CoreMLExecutionProvider
+                #try: # Frames with no detection cause errors on MacOS CoreMLExecutionProvider
                     # Detect poses
-                    if not (image_action is None):
-                        action_str = index_mapping[image_action]
+                if not (image_action is None):
+                    action_str = index_mapping[image_action]
 
-                        frame = cv2.rotate(frame,image_action)
-                    else:
-                        action_str = "None"
+                    frame = cv2.rotate(frame,image_action)
+                else:
+                    action_str = "None"
 
-                    height, width = frame.shape[:2]
-                    center = (width // 2, height // 2)
-                    scale = 1
-                    #rotation_matrix = cv2.getRotationMatrix2D(center, roll, scale)
-                    
-                    #rotated_image = cv2.warpAffine(frame, rotation_matrix, (width, height))
-                    #print(f'roll : {roll}\n ACTION : {action_str}')
-                    keypoints, scores = pose_tracker(frame)
+                height, width = frame.shape[:2]
+                center = (width // 2, height // 2)
+                scale = 1
+                #rotation_matrix = cv2.getRotationMatrix2D(center, roll, scale)
+                
+                #rotated_image = cv2.warpAffine(frame, rotation_matrix, (width, height))
+                #print(f'roll : {roll}\n ACTION : {action_str}')
+                keypoints, scores = pose_tracker(frame)
 
-                    kp = np.asarray(keypoints, dtype=float)
-                    x, y = kp[..., 0].copy(), kp[..., 1].copy()
+                kp = np.asarray(keypoints, dtype=float)
+                x, y = kp[..., 0].copy(), kp[..., 1].copy()
 
-                    if image_action == cv2.ROTATE_180:
-                        kp[..., 0], kp[..., 1] = W - 1 - x, H - 1 - y
-                    elif image_action == cv2.ROTATE_90_CLOCKWISE:
-                        kp[..., 0], kp[..., 1] = y, H - 1 - x
-                    elif image_action == cv2.ROTATE_90_COUNTERCLOCKWISE:
-                        kp[..., 0], kp[..., 1] = W - 1 - y, x
+                if image_action == cv2.ROTATE_180:
+                    kp[..., 0], kp[..., 1] = W - 1 - x, H - 1 - y
+                elif image_action == cv2.ROTATE_90_CLOCKWISE:
+                    kp[..., 0], kp[..., 1] = y, H - 1 - x
+                elif image_action == cv2.ROTATE_90_COUNTERCLOCKWISE:
+                    kp[..., 0], kp[..., 1] = W - 1 - y, x
 
-                    #inv = cv2.invertAffineTransform(rotation_matrix)
-                    #pts = keypoints.reshape(-1, 1, 2).astype(np.float32)
-                    #keypoints = cv2.transform(pts, inv).reshape(keypoints.shape)
-                    #print(keypoints)
+                #inv = cv2.invertAffineTransform(rotation_matrix)
+                #pts = keypoints.reshape(-1, 1, 2).astype(np.float32)
+                #keypoints = cv2.transform(pts, inv).reshape(keypoints.shape)
+                #print(keypoints)
 
-                    # Non maximum suppression (at pose level, not detection, and only using likely keypoints)
-                    frame_shape = frame.shape
-                    mask_scores = np.mean(scores, axis=1) > 0.2
+                # Non maximum suppression (at pose level, not detection, and only using likely keypoints)
+                frame_shape = frame.shape
+                mask_scores = np.mean(scores, axis=1) > 0.2
 
-                    likely_keypoints = np.where(mask_scores[:, np.newaxis, np.newaxis], keypoints, np.nan)
-                    likely_scores = np.where(mask_scores[:, np.newaxis], scores, np.nan)
-                    likely_bboxes = bbox_xyxy_compute(frame_shape, likely_keypoints, padding=0)
-                    score_likely_bboxes = np.nanmean(np.where(np.isnan(likely_scores), 0, likely_scores), axis=1)
+                likely_keypoints = np.where(mask_scores[:, np.newaxis, np.newaxis], keypoints, np.nan)
+                likely_scores = np.where(mask_scores[:, np.newaxis], scores, np.nan)
+                likely_bboxes = bbox_xyxy_compute(frame_shape, likely_keypoints, padding=0)
+                score_likely_bboxes = np.nanmean(np.where(np.isnan(likely_scores), 0, likely_scores), axis=1)
 
-                    valid_indices = np.where(score_likely_bboxes > average_likelihood_threshold_pose)[0]
-                    if len(valid_indices) > 0:
-                        valid_bboxes = likely_bboxes[valid_indices]
-                        valid_scores = score_likely_bboxes[valid_indices]
-                        keep_valid = nms(valid_bboxes, valid_scores, nms_thr=0.45)
-                        keep = valid_indices[keep_valid]
-                    else:
-                        keep = []
-                    keypoints, scores = likely_keypoints[keep], likely_scores[keep]
+                valid_indices = np.where(score_likely_bboxes > average_likelihood_threshold_pose)[0]
+                if len(valid_indices) > 0:
+                    valid_bboxes = likely_bboxes[valid_indices]
+                    valid_scores = score_likely_bboxes[valid_indices]
+                    keep_valid = nms(valid_bboxes, valid_scores, nms_thr=0.45)
+                    keep = valid_indices[keep_valid]
+                else:
+                    keep = []
+                keypoints, scores = likely_keypoints[keep], likely_scores[keep]
 
-                    # Track poses across frames
-                    if tracking_mode == 'deepsort':
-                        keypoints, scores = sort_people_deepsort(keypoints, scores, deepsort_tracker, frame)
-                    if tracking_mode == 'sports2d': 
-                        if 'prev_keypoints' not in locals(): # Initialization
-                            prev_keypoints = keypoints
-                            if use_prediction:
-                                pred_displacement = np.zeros((len(keypoints), 2))
-                            else:
-                                pred_displacement = None
-                        ret = sort_people_sports2d(prev_keypoints, keypoints, scores=scores, 
-                                                match_by=match_by, pred_displacement=pred_displacement, 
-                                                max_dist=max_distance_px, 
-                                                max_unseen_frames=max_unseen_frames, frames_since_last_seen=frames_since_last_seen)
+                # Track poses across frames
+                if tracking_mode == 'deepsort':
+                    keypoints, scores = sort_people_deepsort(keypoints, scores, deepsort_tracker, frame)
+                if tracking_mode == 'sports2d': 
+                    if 'prev_keypoints' not in locals(): # Initialization
+                        prev_keypoints = keypoints
                         if use_prediction:
-                            prev_keypoints, keypoints, scores, frames_since_last_seen, pred_displacement = ret
+                            pred_displacement = np.zeros((len(keypoints), 2))
                         else:
-                            prev_keypoints, keypoints, scores, frames_since_last_seen = ret
+                            pred_displacement = None
+                    ret = sort_people_sports2d(prev_keypoints, keypoints, scores=scores, 
+                                            match_by=match_by, pred_displacement=pred_displacement, 
+                                            max_dist=max_distance_px, 
+                                            max_unseen_frames=max_unseen_frames, frames_since_last_seen=frames_since_last_seen)
+                    if use_prediction:
+                        prev_keypoints, keypoints, scores, frames_since_last_seen, pred_displacement = ret
                     else:
-                        pass
+                        prev_keypoints, keypoints, scores, frames_since_last_seen = ret
+                else:
+                    pass
 
-                except:
+                #except:
                     keypoints = np.full((1,kpt_id_max,2), fill_value=np.nan)
                     scores = np.full((1,kpt_id_max), fill_value=np.nan)
                     
@@ -586,7 +591,7 @@ def process_video(video_path, pose_tracker, skeleton_model, frame_range, average
 def process_video_worker(video_path, ModelClass, det_frequency, mode, backend, device,
                          skeleton_model, frame_range, average_likelihood_threshold_pose,
                          output_format, save_video, save_images, display_detection, tracking_mode,
-                         sports2d_tracking_params, deepsort_params, init_lock, cancel_event):
+                         sports2d_tracking_params, deepsort_params, init_lock, cancel_event, calib=None):
     '''
     Worker function for parallel pose estimation. Creates its own PoseTracker
     and optional DeepSort tracker, then processes one video independently.
@@ -600,9 +605,7 @@ def process_video_worker(video_path, ModelClass, det_frequency, mode, backend, d
     if tracking_mode == 'deepsort':
         from deep_sort_realtime.deepsort_tracker import DeepSort
         deepsort_tracker = DeepSort(**deepsort_params)
-    process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, 
-                  output_format, save_video, save_images, display_detection,
-                  tracking_mode, sports2d_tracking_params, deepsort_tracker, cancel_event=cancel_event)
+    process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, sports2d_tracking_params, deepsort_tracker, calib=calib)
 
 
 def process_images(image_folder_path, pose_tracker, skeleton_model, output_format, fps, save_video, save_images, display_detection, frame_range, tracking_mode, sports2d_tracking_params, deepsort_tracker):
@@ -735,6 +738,18 @@ def process_images(image_folder_path, pose_tracker, skeleton_model, output_forma
         logging.info(f"--> Output images saved to {img_output_dir}.")
     if display_detection:
         cv2.destroyAllWindows()
+
+
+def get_roll(video_path, calib):
+    cam_id = video_path.suffixes[0][1:]
+    cam = calib[str(cam_id)]
+    rvec = np.array(cam['rotation'])  
+    R, _ = cv2.Rodrigues(rvec)
+    up = R @ np.array([0, 0, 1])          # world up in camera coords (assumes Z-up world)
+    roll = np.degrees(np.arctan2(up[0], -up[1]))
+    roll = roll % 360
+    return roll
+
 
 
 def estimate_pose_all(config_dict):
@@ -906,7 +921,7 @@ def estimate_pose_all(config_dict):
                             ModelClass, det_frequency, mode, backend, device,
                             skeleton_model, frame_range, average_likelihood_threshold_pose,
                             output_format, save_video, save_images, display_detection, tracking_mode,
-                            sports2d_tracking_params, deepsort_params, init_lock, cancel_event
+                            sports2d_tracking_params, deepsort_params, init_lock, cancel_event, calib
                         ): video_path for video_path in video_files
                     }
                     try:
@@ -948,8 +963,7 @@ def estimate_pose_all(config_dict):
                     up = R @ np.array([0, 0, 1])          # world up in camera coords (assumes Z-up world)
                     roll = np.degrees(np.arctan2(up[0], -up[1]))
                     print(roll)
-                    process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker, roll=roll)
-
+                    process_video(video_path, pose_tracker, skeleton_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, sports2d_tracking_params, deepsort_tracker, calib=calib)
         else:
             # Process image folders
             image_folders = sorted([Path(video_dir) / f for f in os.listdir(video_dir) if (Path(video_dir) / f).is_dir()])
