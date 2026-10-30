@@ -82,7 +82,7 @@ def get_opensim_setup_dir():
     return setup_dir
 
 
-def get_model_path(use_simple_model, osim_setup_dir):
+def get_model_path(use_simple_model, osim_setup_dir,use_custom_model : bool = False ):
     '''
     Retrieve the path of the OpenSim model file.
 
@@ -93,8 +93,10 @@ def get_model_path(use_simple_model, osim_setup_dir):
     OUTPUTS:
     - pose_model_path: (Path) Path to the OpenSim model file.
     '''
-
-    if use_simple_model:
+    assert not (use_simple_model and use_custom_model)
+    if use_custom_model:
+        pose_model_file = 'Model_Pose2Sim_custom.osim'
+    elif use_simple_model:
         pose_model_file = 'Model_Pose2Sim_simple.osim'
     else:
         pose_model_file = 'Model_Pose2Sim_muscles_flex.osim'
@@ -399,7 +401,7 @@ def update_scale_values(scaling_root, segment_ratio_dict):
         
 
 def perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir, 
-                    use_simple_model=False, right_left_symmetry=True, subject_height=1.75, subject_mass=70, 
+                    use_simple_model=False, use_custom_model=False, right_left_symmetry=True, subject_height=1.75, subject_mass=70, 
                     remove_scaling_setup=True, large_hip_knee_angles=90, trimmed_extrema_percent=50):
     '''
     Perform model scaling based on the (not necessarily static) TRC file:
@@ -428,7 +430,7 @@ def perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir,
     try:
         # Load model
         opensim.ModelVisualizer.addDirToGeometrySearchPaths(str(osim_setup_dir / 'Geometry'))
-        unscaled_model_path = get_model_path(use_simple_model, osim_setup_dir)
+        unscaled_model_path = get_model_path(use_simple_model, osim_setup_dir, use_custom_model)
         if not unscaled_model_path:
             raise ValueError(f"Unscaled OpenSim model not found at: {unscaled_model_path}")
         unscaled_model = opensim.Model(str(unscaled_model_path))
@@ -614,6 +616,7 @@ def kinematics_all(config_dict):
 
     use_augmentation = config_dict.get('kinematics', {}).get('use_augmentation', True)
     use_simple_model = config_dict.get('kinematics', {}).get('use_simple_model', False)
+    use_custom_model = config_dict.get('kinematics', {}).get('use_custom_model', False)
     filter_ik = config_dict.get('kinematics', {}).get('filter_ik', False)
     make_bvh = config_dict.get('kinematics', {}).get('make_bvh', True)
     multi_person = config_dict.get('project', {}).get('multi_person', False)
@@ -729,7 +732,7 @@ def kinematics_all(config_dict):
     for p, trc_file in enumerate(trc_files):
         logging.info(f"Subject mass: {round(subject_mass[p],2)} kg")
         logging.info(f"\nScaling TRC file: {trc_file.resolve()}...")
-        perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir, use_simple_model, right_left_symmetry=right_left_symmetry, subject_height=subject_height[p], subject_mass=subject_mass[p], 
+        perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir, use_simple_model, use_custom_model, right_left_symmetry=right_left_symmetry, subject_height=subject_height[p], subject_mass=subject_mass[p], 
                         remove_scaling_setup=remove_scaling_setup, large_hip_knee_angles=large_hip_knee_angles, trimmed_extrema_percent=trimmed_extrema_percent)
         logging.info(f"\tDone. Scaled model saved to {(kinematics_dir / (trc_file.stem + '_scaled.osim')).resolve()}")
 
